@@ -1,0 +1,182 @@
+Manual de Parâmetros da Receita .fbuild
+=======================================
+
+Cada receita do fbuild é um arquivo de texto simples em shell-style (`VAR=valor`).
+Abaixo está a lista completa de parâmetros suportados e seus usos.
+
+------------------------------------------------------------
+1. Metadados básicos
+------------------------------------------------------------
+name=<string>
+    Nome do pacote. Deve ser único no repositório.
+
+version=<string>
+    Versão do pacote (ex.: 1.2.3, 2.40).
+
+release=<int>
+    Número da release dentro da mesma versão (ex.: 1, 2).
+    Útil quando você precisa corrigir patches sem mudar a versão upstream.
+
+desc="<texto>"
+    Descrição curta do pacote.
+
+license=<identificador>
+    Licença do software. Exemplos: GPL-3.0, LGPL-2.1, MIT, MPL-2.0.
+
+homepage=<url>
+    URL da página oficial do software.
+
+maintainer="<nome/email>"
+    (opcional) Indica o responsável pela receita.
+
+------------------------------------------------------------
+2. Fontes e checksums
+------------------------------------------------------------
+sources=(url1 url2 ...)
+    Lista de URLs para baixar os tarballs, zips ou repositórios git.
+    Exemplos:
+      sources=(https://ftp.gnu.org/gnu/hello/hello-2.12.tar.gz)
+      sources=(git+https://github.com/mypkg.git)
+
+sha256=(hash1 hash2 ...)
+    Lista de checksums correspondentes aos arquivos declarados em sources.
+
+patches=(file1.patch file2.patch)
+    Lista de patches a aplicar após extrair o código-fonte.
+
+------------------------------------------------------------
+3. Dependências
+------------------------------------------------------------
+depends=(pkg1 pkg2 ...)
+    Pacotes que precisam estar instalados antes de compilar.
+
+makedepends=(pkg1 pkg2 ...)
+    Dependências necessárias apenas para compilar (não em runtime).
+
+optdepends=(pkg1:descrição pkg2:descrição)
+    Dependências opcionais, com explicação.
+
+conflicts=(pkg1 pkg2 ...)
+    Pacotes que não podem ser instalados ao mesmo tempo.
+
+provides=(virtual1 virtual2)
+    "Nomes virtuais" fornecidos por este pacote (ex.: "cc" para gcc).
+
+replaces=(pkg1 pkg2 ...)
+    Pacotes substituídos por este.
+
+------------------------------------------------------------
+4. Build system
+------------------------------------------------------------
+build=<tipo>
+    Define o sistema de build usado:
+      - autotools
+      - cmake
+      - meson
+      - custom  (você define manualmente os passos)
+
+configure_args=(args...)
+    Argumentos extras para ./configure (autotools).
+
+cmake_args=(args...)
+    Argumentos extras para cmake.
+
+meson_args=(args...)
+    Argumentos extras para meson.
+
+make_args=(args...)
+    Argumentos extras para make.
+
+ninja_args=(args...)
+    Argumentos extras para ninja.
+
+------------------------------------------------------------
+5. Diretórios e paths
+------------------------------------------------------------
+prefix=<path>
+    Caminho de instalação principal (default: /usr).
+
+bindir=<path>
+    Diretório de binários (default: $prefix/bin).
+
+libdir=<path>
+    Diretório de bibliotecas (default: $prefix/lib).
+
+includedir=<path>
+    Diretório de headers (default: $prefix/include).
+
+datadir=<path>
+    Diretório de dados (default: $prefix/share).
+
+------------------------------------------------------------
+6. Hooks e fases customizadas
+------------------------------------------------------------
+pre_extract() { ... }
+    Executado antes de extrair os sources.
+
+post_extract() { ... }
+    Executado após extrair.
+
+pre_build() { ... }
+    Executado antes do build.
+
+post_build() { ... }
+    Executado depois do build.
+
+pre_install() { ... }
+    Executado antes de instalar no DESTDIR.
+
+post_install() { ... }
+    Executado depois de instalar.
+
+check() { ... }
+    Executado para rodar testes (ex.: make check).
+
+clean() { ... }
+    Customiza a limpeza de diretórios temporários.
+
+------------------------------------------------------------
+7. Variáveis adicionais
+------------------------------------------------------------
+archs=(x86_64 aarch64 riscv64)
+    Plataformas suportadas.
+
+options=(strip docs manpages debug)
+    Flags opcionais de build (controla se remove símbolos, instala docs, etc.).
+
+backup=(/etc/arquivo.conf)
+    Lista de arquivos que devem ser preservados durante upgrades.
+
+groups=(base-devel xorg multimedia)
+    Grupos de pacotes (útil em metapacotes).
+
+------------------------------------------------------------
+8. Exemplos rápidos
+------------------------------------------------------------
+
+# Receita simples
+name=hello
+version=2.12
+release=1
+desc="GNU Hello"
+license=GPL-3.0
+homepage=https://www.gnu.org/software/hello/
+sources=(https://ftp.gnu.org/gnu/hello/hello-2.12.tar.gz)
+sha256=(6d91d7bc5c276f1c99c9e8d2a8e5c6cfe3a24e54631e7a5c45d6efb3f4d8a6f2)
+build=autotools
+depends=(glibc)
+
+# Receita avançada
+name=firefox
+version=128.0
+release=1
+desc="Mozilla Firefox"
+license=MPL-2.0
+homepage=https://mozilla.org/firefox/
+sources=(https://archive.mozilla.org/pub/firefox/releases/128.0/source/firefox-128.0.source.tar.xz)
+sha256=(6c2e8f02a25f1f6c7d4f0f9d5f928b36f1ac3cb9346de4aa0f8e08b637f3d98c)
+build=meson
+depends=(glibc gcc)
+makedepends=(rust cargo clang nodejs python3)
+options=(strip docs)
+groups=(extra)
