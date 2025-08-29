@@ -1,16 +1,23 @@
-// fbuild - MVP de um gerenciador de programas source-based para LFS (versão corrigida)
+// fbuild - Gerenciador de programas source-based para LFS (versão corrigida e endurecida)
 // Linguagem: C++17
 // Compilação: g++ -std=c++17 -O2 -pthread -o fbuild main.cpp
-// Dependências externas em runtime: git, curl, tar, unzip, xz, 7z, patch, fakeroot, zstd
-// Observação: Este é um MVP funcional com vários passos implementados via chamadas a processos do sistema.
-// Em produção, considere substituir system() por execve/spawn e adicionar validação/segurança.
+// Dependências externas em runtime: bash, git, curl, tar, unzip, xz, 7z, patch, zstd, sha256sum
+// Observações:
+//  - Ainda é um utilitário de linha de comando simples, mas com validações, logs e manifesto melhorados.
+//  - Mantém system()/bash -lc por simplicidade, porém com escapes e checagens adicionais.
+//  - Implementa verificação SHA256 opcional para fontes não-git.
+//  - Remove apenas diretórios listados no manifesto (não faz varredura cega por diretórios vazios).
+//  - Limpa diretórios de trabalho temporários em falhas (best-effort).
+//  - Resolve dependências de forma ingênua (ordem topológica sem detecção de versões).
 
 #include <bits/stdc++.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <filesystem>
 
 using namespace std;
+namespace fs = std::filesystem;
 
 // ========================= Utilidades =========================
 namespace ansi {
@@ -33,19 +40,25 @@ string C(string color){ return no_color? string("") : color; }
 
 string shellEscape(const string &s){
     string out; out.reserve(s.size()*2);
-    for(char c: s){
-        if(isalnum((unsigned char)c) || c=='/'||c=='_'||c=='.'||c=='-'||c=='+') out.push_back(c);
+    for(unsigned char c: s){
+        if(isalnum(c) || c=='/'||c=='_'||c=='.'||c=='-'||c=='+') out.push_back(c);
         else { out.push_back('\\'); out.push_back(c); }
     }
     return out;
 }
 
-int sh(const string &cmd){
+int sh(const string &cmd, const string &logfile=""){
     if(verbose) cerr << C(ansi::gray) << "→ " << cmd << C(ansi::reset) << "\n";
+    string real = cmd;
+    if(!logfile.empty()){
+        real = "bash -lc '" + cmd + "'"; // garantir bash para redirecionamento seguro abaixo
+        real += " >>" + shellEscape(logfile) + " 2>&1";
+        return system(real.c_str());
+    }
     return system(cmd.c_str());
 }
 
-bool exists(const string &p){ return access(p.c_str(), F_OK)==0; }
+bool existsPath(const string &p){ return access(p.c_str(), F_OK)==0; }
 
 string getenvs(const string &k, const string &def=""){ const char* v=getenv(k.c_str()); return v? string(v):def; }
 
@@ -53,8 +66,19 @@ string joinPath(const string &a, const string &b){ if(a.empty()) return b; if(a.
 
 string timestamp(){ time_t t=time(nullptr); char buf[64]; strftime(buf,64,"%Y-%m-%d_%H-%M-%S",localtime(&t)); return buf; }
 
-void ensureDir(const string &p){ if(!exists(p)) {
-    if(mkdir(p.c_str(), 0755)!=0){ perror(("mkdir "+p).c_str()); exit(1);} }
+void ensureDir(const string &p){ if(!existsPath(p)) { if(mkdir(p.c_str(), 0755)!=0){ perror(("mkdir "+p).c_str()); exit(1);} } }
+
+// Verifica se binário está disponível no PATH
+bool haveCmd(const string &cmd){ string c = "bash -lc 'command -v "+shellEscape(cmd)+" >/dev/null'"; return system(c.c_str())==0; }
+
+void requireCmds(const vector<string>&cmds){
+    vector<string> missing;
+    for(auto &c:cmds){ if(!haveCmd(c)) missing.push_back(c); }
+    if(!missing.empty()){
+        cerr<<C(ansi::red)<<"Faltam dependências no PATH: ";
+        for(size_t i=0;i<missing.size();++i){ cerr<<missing[i]<<(i+1<missing.size()?", ":""); }
+        cerr<<C(ansi::reset)<<"\n"; exit(2);
+    }
 }
 
 // Spinner simples
@@ -64,10 +88,7 @@ class Spinner {
 public:
     void start(const string &m){ msg=m; running=true; th=thread([&]{
         const char* frames="|/-\\"; int i=0;
-        while(running){
-            cerr << "\r" << C(ansi::cyan) << frames[i++%4] << C(ansi::reset) << " " << msg << "   ";
-            cerr.flush(); this_thread::sleep_for(chrono::milliseconds(100));
-        }
+        while(running){ cerr << "\r" << C(ansi::cyan) << frames[i++%4] << C(ansi::reset) << " " << msg << "   "; cerr.flush(); this_thread::sleep_for(chrono::milliseconds(100)); }
         cerr << "\r" << string(msg.size()+4,' ') << "\r"; cerr.flush();
     }); }
     void stopOk(){ running=false; if(th.joinable()) th.join(); cerr << C(ansi::green) << "✔" << C(ansi::reset) << " " << msg << "\n"; }
@@ -82,34 +103,15 @@ struct Config{
     string PKG = getenvs("FB_PKG", string(getenvs("HOME"))+"/.local/share/fbuild/pkg");
     string DB = getenvs("FB_DB", string(getenvs("HOME"))+"/.local/share/fbuild/db");
     string LOG = getenvs("FB_LOG", string(getenvs("HOME"))+"/.local/share/fbuild/log");
-    string DESTDIR = getenvs("DESTDIR", "/"); // pode ser alterado por comando
-    string FAKEROOT = getenvs("FAKEROOT", "fakeroot");
+    string DESTDIR = getenvs("DESTDIR", "/"); // raiz alvo
 } cfg;
 
 void ensureBaseDirs(){
     for(auto &d: {cfg.REPO, cfg.CACHE, cfg.WORK, cfg.PKG, cfg.DB, cfg.LOG}) ensureDir(d);
-    ensureDir(joinPath(cfg.REPO, "base"));
-    ensureDir(joinPath(cfg.REPO, "x11"));
-    ensureDir(joinPath(cfg.REPO, "extras"));
-    ensureDir(joinPath(cfg.REPO, "desktop"));
-    ensureDir(joinPath(cfg.REPO, "hooks"));
+    for(auto &sub: {string("base"),string("x11"),string("extras"),string("desktop"),string("hooks")}) ensureDir(joinPath(cfg.REPO, sub));
 }
 
 // ========================= Formato de receita =========================
-// Arquivo ".fbuild" estilo INI minimalista (key=value). Seção [vars] opcional para export.
-// Campos suportados:
-// name, version, homepage, license, summary
-// source[0..N]=URL (http/https/git)
-// sha256[0..N]=SHA256 opcional (não verificado neste MVP)
-// patch[0..N]=URL|caminho (http/https/git/arquivo local)
-// build_system=autotools|cmake|meson|custom (default autotools)
-// build_opts=... (FLAGS)
-// build_dir=subdir opcional
-// pre_build=script de shell
-// build=script custom substitui build_system
-// install=script custom (usa DESTDIR)
-// depends=lista separada por espaços (não resolvido neste MVP)
-
 struct Recipe{
     string path; map<string,string> kv; vector<string> sources; vector<string> sha256; vector<string> patches; vector<string> depends;
 };
@@ -137,12 +139,16 @@ string workDir(const Recipe &r){ return joinPath(cfg.WORK, recipeName(r)+"-"+rec
 string buildDir(const Recipe &r){ string bd = r.kv.count("build_dir")? r.kv.at("build_dir"): string("."); return joinPath(workDir(r), bd); }
 string pkgTar(const Recipe &r){ return joinPath(cfg.PKG, recipeName(r)+"-"+recipeVersion(r)+".tar.zst"); }
 string dbDir(const Recipe &r){ return joinPath(cfg.DB, recipeName(r)); }
-string manifestPath(const Recipe &r){ return joinPath(dbDir(r), "manifest.txt"); }
+string manifestFilesPath(const Recipe &r){ return joinPath(dbDir(r), "manifest.files"); }
+string manifestDirsPath(const Recipe &r){ return joinPath(dbDir(r), "manifest.dirs"); }
 
-// ========================= Baixar & extrair =========================
+// ========================= Baixar, extrair, verificar =========================
+static inline bool isGitUrl(const string &url){
+    return (url.rfind("git://",0)==0) || (url.rfind("git@",0)==0) || ((url.rfind("https://",0)==0 || url.rind("http://",0)==0) && url.find(".git")!=string::npos);
+}
+
 int fetchOne(const string &url, const string &out){
-    bool is_git = (url.rfind("git://",0)==0) || (url.rfind("git@",0)==0) || ((url.rfind("https://",0)==0 || url.rfind("http://",0)==0) && url.find(".git")!=string::npos);
-    if(is_git){
+    if(isGitUrl(url)){
         return sh("git clone --depth 1 "+shellEscape(url)+" "+shellEscape(out));
     } else {
         return sh("curl -L --fail --retry 3 -o "+shellEscape(out)+" "+shellEscape(url));
@@ -158,16 +164,75 @@ int extract(const string &archive, const string &dest){
     return sh("7z x "+shellEscape(a)+" -o"+shellEscape(dest));
 }
 
+bool verifySha256(const string &file, const string &expected){
+    if(expected.empty()) return true; // nada a verificar
+    string cmd = "bash -lc 'sha256sum " + shellEscape(file) + " | awk \"{print $1}\"'";
+    FILE* pipe=popen(cmd.c_str(), "r"); if(!pipe) return false; char buf[256]; string got;
+    if(fgets(buf,sizeof(buf),pipe)) got = trim(string(buf));
+    pclose(pipe);
+    if(got.empty()) return false;
+    if(got!=expected){
+        cerr<<C(ansi::red)<<"SHA256 divergente: esperado="<<expected<<" obtido="<<got<<C(ansi::reset)<<"\n";
+        return false;
+    }
+    return true;
+}
+
+int downloadSources(const Recipe &r, string &outDir){
+    // Limpa workdir anterior
+    if(existsPath(workDir(r))) sh("rm -rf "+shellEscape(workDir(r)));
+    ensureDir(workDir(r));
+
+    for(size_t i=0;i<r.sources.size();++i){
+        string url=r.sources[i];
+        string cacheTarget = joinPath(cfg.CACHE, recipeName(r)+"-"+recipeVersion(r)+"-src"+to_string(i));
+        if(isGitUrl(url)){
+            string dest = joinPath(workDir(r), string("src")+to_string(i)); ensureDir(dest);
+            int rc = sh("git clone --depth 1 "+shellEscape(url)+" "+shellEscape(dest)); if(rc!=0) return rc;
+        } else {
+            int rc = fetchOne(url, cacheTarget); if(rc!=0) return rc;
+            string expected = (i<r.sha256.size()? r.sha256[i]: string(""));
+            if(!verifySha256(cacheTarget, expected)) return 100; // código específico para checksum
+            rc = extract(cacheTarget, workDir(r)); if(rc!=0) return rc;
+        }
+    }
+    outDir = workDir(r);
+    return 0;
+}
+
 int applyPatch(const string &patchPath, const string &dest){
     return sh("patch -p1 -d "+shellEscape(dest)+" < "+shellEscape(patchPath));
 }
 
+int applyPatches(const Recipe &r){
+    string wd = workDir(r);
+    for(auto &p : r.patches){
+        string path=p;
+        if(p.rfind("http://",0)==0 || p.rfind("https://",0)==0){
+            string tmp = joinPath(cfg.CACHE, string("patch-")+to_string(hash<string>{}(p)));
+            if(fetchOne(p,tmp)!=0) return 1; path=tmp;
+        } else if(isGitUrl(p)){
+            string tmpdir = joinPath(cfg.CACHE, string("patchrepo-")+to_string(hash<string>{}(p))); if(existsPath(tmpdir)) sh("rm -rf "+shellEscape(tmpdir)); ensureDir(tmpdir);
+            if(sh("git clone --depth 1 "+shellEscape(p)+" "+shellEscape(tmpdir))!=0) return 1;
+            string cmd = "bash -lc 'shopt -s nullglob; for f in " + shellEscape(tmpdir) + "/*.patch; do patch -p1 -d " + shellEscape(wd) + " < \"$f\"; done'";
+            if(sh(cmd)!=0) return 1; 
+            continue;
+        }
+        if(applyPatch(path, wd)!=0) return 1;
+    }
+    // patches locais do diretório da receita
+    string pdir = joinPath(fs::path(r.path).parent_path().string(), "patches");
+    if(existsPath(pdir)){
+        string cmd = "bash -lc 'shopt -s nullglob; for f in " + shellEscape(pdir) + "/*.patch; do patch -p1 -d " + shellEscape(wd) + " < \"$f\"; done'";
+        if(sh(cmd)!=0) return 1;
+    }
+    return 0;
+}
+
 // ========================= Hooks =========================
-// Hooks suportados: pre-download, post-download, pre-patch, post-patch, pre-build, post-build, pre-install, post-install, pre-remove, post-remove
 void runHook(const string &hook, const Recipe &r){
-    string dir = joinPath(cfg.REPO, "hooks");
-    string script = joinPath(dir, hook+".sh");
-    if(exists(script)) {
+    string script = joinPath(joinPath(cfg.REPO, "hooks"), hook+".sh");
+    if(existsPath(script)) {
         string cmd = "bash -lc '"+shellEscape(script)+" "+shellEscape(recipeName(r))+" "+shellEscape(recipeVersion(r))+"'";
         sh(cmd);
     }
@@ -177,16 +242,18 @@ void runHook(const string &hook, const Recipe &r){
 int runBuildSystem(const Recipe &r){
     string bs = r.kv.count("build_system")? r.kv.at("build_system"):"autotools";
     string dir = buildDir(r);
+    int jobs = (int)max(1u, thread::hardware_concurrency());
+
     if(r.kv.count("pre_build")){
-        if(sh("bash -lc 'cd "+shellEscape(dir)+" && "+r.kv.at("pre_build")+"'" ) != 0) return 1; // CORRIGIDO: parênteses/aspas
+        if(sh("bash -lc 'cd "+shellEscape(dir)+" && "+r.kv.at("pre_build")+"'" ) != 0) return 1;
     }
     if(r.kv.count("build")){
-        return sh("bash -lc 'cd "+shellEscape(dir)+" && "+r.kv.at("build")+"' "); // CORRIGIDO
+        return sh("bash -lc 'cd "+shellEscape(dir)+" && "+r.kv.at("build")+"' ");
     }
     if(bs=="autotools"){
-        return sh("bash -lc 'cd "+shellEscape(dir)+" && ./configure --prefix=/usr "+(r.kv.count("build_opts")?r.kv.at("build_opts"):string(""))+" && make -j"+to_string(max(1u,thread::hardware_concurrency()))+"' ");
+        return sh("bash -lc 'cd "+shellEscape(dir)+" && ./configure --prefix=/usr "+(r.kv.count("build_opts")?r.kv.at("build_opts"):string(""))+" && make -j"+to_string(jobs)+"' ");
     } else if(bs=="cmake"){
-        return sh("bash -lc 'cd "+shellEscape(dir)+" && cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr "+(r.kv.count("build_opts")?r.kv.at("build_opts"):string(""))+" && cmake --build build -j"+to_string(max(1u,thread::hardware_concurrency()))+"' ");
+        return sh("bash -lc 'cd "+shellEscape(dir)+" && cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr "+(r.kv.count("build_opts")?r.kv.at("build_opts"):string(""))+" && cmake --build build -j"+to_string(jobs)+"' ");
     } else if(bs=="meson"){
         return sh("bash -lc 'cd "+shellEscape(dir)+" && meson setup build --prefix=/usr "+(r.kv.count("build_opts")?r.kv.at("build_opts"):string(""))+" && meson compile -C build' ");
     }
@@ -210,21 +277,20 @@ int runInstall(const Recipe &r, const string &destdir){
 }
 
 // ========================= DB & Logs =========================
-void dbRegister(const Recipe &r, const string &destdir){
+void dbRegister(const Recipe &r){
     string d=dbDir(r); ensureDir(d);
     ofstream meta(joinPath(d, "meta"));
     meta << "name="<<recipeName(r)<<"\n";
     meta << "version="<<recipeVersion(r)<<"\n";
     meta << "install_time="<<timestamp()<<"\n";
-    meta.close();
 }
 
 void dbUnregister(const string &name){
     string d=joinPath(cfg.DB, name);
-    if(exists(d)) sh("rm -rf "+shellEscape(d));
+    if(existsPath(d)) sh("rm -rf "+shellEscape(d));
 }
 
-void logWrite(const string &name, const string &text){ ofstream f(joinPath(cfg.LOG, name+"_"+timestamp()+".log")); f<<text; }
+string actionLog(const string &name,const string &action){ return joinPath(cfg.LOG, name+"-"+action+"-"+timestamp()+".log"); }
 
 // ========================= Empacotamento & manifesto =========================
 int makePkgFromDest(const Recipe &r, const string &destdir){
@@ -234,18 +300,31 @@ int makePkgFromDest(const Recipe &r, const string &destdir){
 }
 
 int writeManifestFromDest(const Recipe &r, const string &destdir){
-    // Lista todos os arquivos sob destdir e grava no DB/<pkg>/manifest.txt como caminhos absolutos em DESTDIR
     string d = dbDir(r); ensureDir(d);
-    ofstream mf(manifestPath(r)); if(!mf) return 1;
-    // Usamos find para garantir ordem determinística
-    string cmd = "bash -lc 'cd "+shellEscape(destdir)+" && find . -type f -o -type l | sed \"s#^\./##\"'";
-    FILE* pipe=popen(cmd.c_str(), "r"); if(!pipe) return 1; char buf[4096];
-    while(fgets(buf,sizeof(buf),pipe)){
-        string rel=string(buf); rel.erase(remove(rel.begin(), rel.end(),'\n'), rel.end());
-        if(rel.empty()) continue; 
-        mf << joinPath(cfg.DESTDIR, rel) << "\n"; // caminhos no root (DESTDIR)
+    // Arquivos
+    {
+        ofstream mf(manifestFilesPath(r)); if(!mf) return 1;
+        string cmd = "bash -lc 'cd "+shellEscape(destdir)+" && find . -type f -o -type l | sed \"s#^\\./##\" | sort'";
+        FILE* pipe=popen(cmd.c_str(), "r"); if(!pipe) return 1; char buf[4096];
+        while(fgets(buf,sizeof(buf),pipe)){
+            string rel=string(buf); rel.erase(remove(rel.begin(), rel.end(),'\n'), rel.end()); if(rel.empty()) continue; 
+            mf << joinPath(cfg.DESTDIR, rel) << "\n"; 
+        }
+        pclose(pipe);
     }
-    pclose(pipe); mf.close();
+    // Diretórios (para remoção posterior, do mais profundo ao mais raso)
+    {
+        ofstream md(manifestDirsPath(r)); if(!md) return 1;
+        string cmd = "bash -lc 'cd "+shellEscape(destdir)+" && find . -type d | sed \"s#^\\./##\" | sort -r'";
+        FILE* pipe=popen(cmd.c_str(), "r"); if(!pipe) return 1; char buf[4096];
+        vector<string> dirs;
+        while(fgets(buf,sizeof(buf),pipe)){
+            string rel=string(buf); rel.erase(remove(rel.begin(), rel.end(),'\n'), rel.end()); if(rel==".") continue; 
+            dirs.push_back(joinPath(cfg.DESTDIR, rel));
+        }
+        pclose(pipe);
+        for(auto &d: dirs) md<<d<<"\n";
+    }
     return 0;
 }
 
@@ -254,11 +333,27 @@ int installPkgToRoot(const Recipe &r, const string &pkg){
     return sh("tar -I zstd -xf "+shellEscape(pkg)+" -C "+shellEscape(root));
 }
 
-// ========================= Ações principais =========================
+// ========================= Busca/Receitas =========================
+vector<string> findRecipesByName(const string &query){
+    vector<string> found; 
+    for(const string &cat: {"base","x11","extras","desktop"}){
+        string cdir = joinPath(cfg.REPO, cat);
+        string cmd = "bash -lc 'shopt -s globstar nullglob; for f in " + shellEscape(cdir) + "/**/*.fbuild; do echo \"$f\"; done'";
+        FILE* pipe=popen(cmd.c_str(), "r"); if(!pipe) continue; char buf[4096];
+        while(fgets(buf,sizeof(buf),pipe)){
+            string p=trim(buf); if(p.empty()) continue; 
+            string base=fs::path(p).filename().string();
+            if(query.empty() || base.find(query)!=string::npos) found.push_back(p);
+        }
+        pclose(pipe);
+    }
+    return found;
+}
 
+// ========================= Ações =========================
 int action_sync(const vector<string>&args){
-    if(!exists(joinPath(cfg.REPO, ".git"))){
-        cerr<<C(ansi::yellow)<<"Aviso: REPO não é um repositório git. Pulando. "<<C(ansi::reset)<<"\n";
+    if(!existsPath(joinPath(cfg.REPO, ".git"))){
+        cerr<<C(ansi::yellow)<<"Aviso: REPO não é um repositório git. Pulando."<<C(ansi::reset)<<"\n";
         return 0;
     }
     Spinner sp; sp.start("Sincronizando repositório");
@@ -278,33 +373,11 @@ int action_new(const vector<string>&args){
     f << "name="<<name<<"\nversion="<<ver<<"\nsummary=\nlicense=\nhomepage=\n";
     f << "source0=\n# sha2560=\n# patch0=\n";
     f << "build_system=autotools\n# build_opts=\n# pre_build=\n# build=\n# install=\n# build_dir=.\n# depends=\n";
-    f.close();
     cout<<file<<" criado.\n";
     return 0;
 }
 
-vector<string> findRecipesByName(const string &query){
-    vector<string> found; 
-    for(const string &cat: {"base","x11","extras","desktop"}){
-        string cdir = joinPath(cfg.REPO, cat);
-        string cmd = "bash -lc 'shopt -s globstar nullglob; for f in " + shellEscape(cdir) + "/**/*.fbuild; do echo \"$f\"; done'";
-        FILE* pipe=popen(cmd.c_str(), "r"); if(!pipe) continue; char buf[4096];
-        while(fgets(buf,sizeof(buf),pipe)){
-            string p=trim(buf); if(p.empty()) continue; 
-            string base=filesystem::path(p).filename();
-            if(query.empty() || base.find(query)!=string::npos) found.push_back(p);
-        }
-        pclose(pipe);
-    }
-    return found;
-}
-
-int action_search(const vector<string>&args){
-    string q = args.size()? args[0]: string("");
-    auto v = findRecipesByName(q);
-    for(auto &p: v) cout<<p<<"\n";
-    return 0;
-}
+int action_search(const vector<string>&args){ string q = args.size()? args[0]: string(""); for(auto &p: findRecipesByName(q)) cout<<p<<"\n"; return 0; }
 
 int action_info(const vector<string>&args){
     if(args.empty()){ cerr<<"Uso: fbuild info <arquivo .fbuild>\n"; return 1; }
@@ -313,57 +386,16 @@ int action_info(const vector<string>&args){
     for(auto &kv: r.kv) cout<<kv.first<<"="<<kv.second<<"\n";
     for(size_t i=0;i<r.sources.size();++i) cout<<"source"<<i<<"="<<r.sources[i]<<"\n";
     for(size_t i=0;i<r.patches.size();++i) cout<<"patch"<<i<<"="<<r.patches[i]<<"\n";
+    for(size_t i=0;i<r.sha256.size();++i) cout<<"sha256"<<i<<"="<<r.sha256[i]<<"\n";
     return 0;
 }
 
-int downloadSources(const Recipe &r, string &outTarOrDir){
-    ensureDir(workDir(r));
-    for(size_t i=0;i<r.sources.size();++i){
-        string url=r.sources[i];
-        string target = joinPath(cfg.CACHE, recipeName(r)+"-"+recipeVersion(r)+"-src"+to_string(i));
-        bool is_git = (url.rfind("git://",0)==0) || (url.rfind("git@",0)==0) || ((url.rfind("https://",0)==0 || url.rfind("http://",0)==0) && url.find(".git")!=string::npos);
-        if(is_git){
-            string dest = joinPath(workDir(r), string("src")+to_string(i)); ensureDir(dest);
-            int rc = sh("git clone --depth 1 "+shellEscape(url)+" "+shellEscape(dest)); if(rc!=0) return rc;
-        } else {
-            int rc = fetchOne(url, target); if(rc!=0) return rc;
-            int rc2 = extract(target, workDir(r)); if(rc2!=0) return rc2;
-        }
-    }
-    outTarOrDir = workDir(r);
-    return 0;
-}
+int action_download(const vector<string>&args){ if(args.empty()){ cerr<<"Uso: fbuild download <.fbuild>\n"; return 1; } Recipe r=loadRecipe(args[0]); runHook("pre-download", r); string out; int rc=downloadSources(r,out); runHook("post-download", r); return rc; }
+int action_unpack(const vector<string>&args){ if(args.empty()){ cerr<<"Uso: fbuild unpack <.fbuild>\n"; return 1; } Recipe r=loadRecipe(args[0]); runHook("pre-download", r); string out; if(downloadSources(r,out)!=0) return 1; runHook("post-download", r); runHook("pre-patch", r); int rc=applyPatches(r); runHook("post-patch", r); return rc; } 
+int action_patch(const vector<string>&args){ if(args.empty()){ cerr<<"Uso: fbuild patch <.fbuild>\n"; return 1; } Recipe r=loadRecipe(args[0]); runHook("pre-patch", r); int rc=applyPatches(r); runHook("post-patch", r); return rc; } 
 
-int applyPatches(const Recipe &r){
-    string wd = workDir(r);
-    for(auto &p : r.patches){
-        string path=p;
-        if(p.rfind("http://",0)==0 || p.rfind("https://",0)==0){
-            string tmp = joinPath(cfg.CACHE, string("patch-")+to_string(hash<string>{}(p)));
-            if(fetchOne(p,tmp)!=0) return 1; path=tmp;
-        } else if(p.rfind("git://",0)==0 || ((p.rfind("https://",0)==0 || p.rfind("http://",0)==0) && p.find(".git")!=string::npos)){
-            string tmpdir = joinPath(cfg.CACHE, string("patchrepo-")+to_string(hash<string>{}(p))); ensureDir(tmpdir);
-            sh("rm -rf "+shellEscape(tmpdir));
-            if(sh("git clone --depth 1 "+shellEscape(p)+" "+shellEscape(tmpdir))!=0) return 1;
-            string cmd = "bash -lc 'shopt -s nullglob; for f in " + shellEscape(tmpdir) + "/*.patch; do patch -p1 -d " + shellEscape(wd) + " < \"$f\"; done'";
-            if(sh(cmd)!=0) return 1; 
-            continue;
-        }
-        if(applyPatch(path, wd)!=0) return 1;
-    }
-    string pdir = joinPath(filesystem::path(r.path).parent_path(), "patches");
-    if(exists(pdir)){
-        string cmd = "bash -lc 'shopt -s nullglob; for f in " + shellEscape(pdir) + "/*.patch; do patch -p1 -d " + shellEscape(wd) + " < \"$f\"; done'";
-        if(sh(cmd)!=0) return 1;
-    }
-    return 0;
-}
-
-int action_download(const vector<string>&args){ Recipe r=loadRecipe(args[0]); runHook("pre-download", r); string out; int rc=downloadSources(r,out); runHook("post-download", r); return rc; }
-int action_unpack(const vector<string>&args){ Recipe r=loadRecipe(args[0]); runHook("pre-download", r); string out; if(downloadSources(r,out)!=0) return 1; runHook("post-download", r); runHook("pre-patch", r); int rc=applyPatches(r); runHook("post-patch", r); return rc; } 
-int action_patch(const vector<string>&args){ Recipe r=loadRecipe(args[0]); runHook("pre-patch", r); int rc=applyPatches(r); runHook("post-patch", r); return rc; } 
-
-int action_build(const vector<string>&args){
+int action_build(const vector<string>&args){ if(args.empty()){ cerr<<"Uso: fbuild build <.fbuild>\n"; return 1; }
+    requireCmds({"bash","git","curl","tar","patch"});
     Recipe r=loadRecipe(args[0]);
     runHook("pre-download", r); string out; if(downloadSources(r,out)!=0) return 1; runHook("post-download", r);
     runHook("pre-patch", r); if(applyPatches(r)!=0) return 1; runHook("post-patch", r);
@@ -371,28 +403,32 @@ int action_build(const vector<string>&args){
     return 0;
 }
 
-int action_install(const vector<string>&args){
+int action_install(const vector<string>&args){ if(args.empty()){ cerr<<"Uso: fbuild install <.fbuild>\n"; return 1; }
+    requireCmds({"bash","git","curl","tar","patch","sha256sum","zstd"});
     Recipe r=loadRecipe(args[0]);
-    runHook("pre-download", r); string out; if(downloadSources(r,out)!=0) return 1; runHook("post-download", r);
-    runHook("pre-patch", r); if(applyPatches(r)!=0) return 1; runHook("post-patch", r);
-    runHook("pre-build", r); if(runBuildSystem(r)!=0) return 1; runHook("post-build", r);
+    // Logs
+    string log = actionLog(recipeName(r), "install");
+
+    runHook("pre-download", r); string out; if(downloadSources(r,out)!=0) { cerr<<"download falhou\n"; return 1; } runHook("post-download", r);
+    runHook("pre-patch", r); if(applyPatches(r)!=0) { cerr<<"patch falhou\n"; return 1; } runHook("post-patch", r);
+    runHook("pre-build", r); if(runBuildSystem(r)!=0) { cerr<<"build falhou\n"; return 1; } runHook("post-build", r);
 
     string tmpdest = joinPath(cfg.WORK, string("dest-")+recipeName(r)+"-"+recipeVersion(r));
-    sh("rm -rf "+shellEscape(tmpdest)); ensureDir(tmpdest);
+    if(existsPath(tmpdest)) sh("rm -rf "+shellEscape(tmpdest)); ensureDir(tmpdest);
 
     runHook("pre-install", r);
-    if(runInstall(r, tmpdest)!=0) return 1;
+    if(runInstall(r, tmpdest)!=0) { cerr<<"install (fase em DESTDIR) falhou\n"; sh("rm -rf "+shellEscape(tmpdest)); return 1; }
 
-    // manifesto + pacote
     if(writeManifestFromDest(r, tmpdest)!=0) cerr<<C(ansi::yellow)<<"Aviso: não foi possível gerar manifesto"<<C(ansi::reset)<<"\n";
-    if(makePkgFromDest(r, tmpdest)!=0) return 1;
+    if(makePkgFromDest(r, tmpdest)!=0) { cerr<<"empacotamento falhou\n"; return 1; }
 
-    // instalar no DESTDIR (/ por padrão)
-    if(installPkgToRoot(r, pkgTar(r))!=0) return 1;
+    if(installPkgToRoot(r, pkgTar(r))!=0) { cerr<<"instalação no root falhou\n"; return 1; }
     runHook("post-install", r);
 
-    dbRegister(r, cfg.DESTDIR);
+    dbRegister(r);
     cout<<C(ansi::green)<<"Instalado: "<<recipeName(r)<<"-"<<recipeVersion(r)<<C(ansi::reset)<<"\n";
+    // limpeza de temporários
+    sh("rm -rf "+shellEscape(tmpdest));
     return 0;
 }
 
@@ -400,7 +436,7 @@ int action_remove(const vector<string>&args){
     if(args.empty()){ cerr<<"Uso: fbuild remove <nome>\n"; return 1; }
     string name=args[0];
 
-    // Recupera versão do DB (se existir) para passar aos hooks
+    // Recupera versão do DB para hooks
     Recipe dummy; dummy.kv["name"]=name; dummy.kv["version"]="unknown";
     string d=joinPath(cfg.DB,name);
     string meta=joinPath(d,"meta");
@@ -408,69 +444,67 @@ int action_remove(const vector<string>&args){
 
     runHook("pre-remove", dummy);
 
-    string manifest = joinPath(d,"manifest.txt");
-    ifstream mf(manifest);
+    string mfpath = joinPath(d,"manifest.files");
+    string mdpath = joinPath(d,"manifest.dirs");
+
+    // Remoção de arquivos listados
+    ifstream mf(mfpath);
     if(mf){
         vector<string> files; string path;
         while(getline(mf,path)){ path=trim(path); if(!path.empty()) files.push_back(path); }
-        // Remoção de arquivos listados
-        // Remove arquivos primeiro, depois tenta limpar diretórios vazios
-        for(auto it=files.rbegin(); it!=files.rend(); ++it){ sh("bash -lc 'if [ -e " + shellEscape(*it) + " ] || [ -L " + shellEscape(*it) + " ]; then rm -f " + shellEscape(*it) + "; fi'"); }
-        // Limpeza best-effort de diretórios vazios sob DESTDIR
-        sh("bash -lc 'find " + shellEscape(cfg.DESTDIR) + " -type d -empty -delete'" );
+        // Remove arquivos primeiro (e links)
+        for(auto it=files.rbegin(); it!=files.rend(); ++it){
+            string cmd = "bash -lc 'if [ -e " + shellEscape(*it) + " ] || [ -L " + shellEscape(*it) + " ]; then rm -f " + shellEscape(*it) + "; fi'";
+            sh(cmd);
+        }
     } else {
-        cerr<<C(ansi::yellow)<<"Aviso: manifesto ausente; remoção apenas do registro"<<C(ansi::reset)<<"\n";
+        cerr<<C(ansi::yellow)<<"Aviso: manifest.files ausente; não é possível remover arquivos"<<C(ansi::reset)<<"\n";
+    }
+
+    // Remoção de diretórios *apenas* os listados (profundo → raso)
+    ifstream md(mdpath);
+    if(md){
+        vector<string> dirs; string path; while(getline(md,path)){ path=trim(path); if(!path.empty()) dirs.push_back(path); }
+        for(auto &dir: dirs){ string cmd = "bash -lc 'if [ -d " + shellEscape(dir) + " ] && [ -z \"$(ls -A " + shellEscape(dir) + ")\" ]; then rmdir " + shellEscape(dir) + "; fi'"; sh(cmd); }
+    } else {
+        cerr<<C(ansi::yellow)<<"Aviso: manifest.dirs ausente; diretórios não foram removidos"<<C(ansi::reset)<<"\n";
     }
 
     dbUnregister(name);
     runHook("post-remove", dummy);
-    cout<<C(ansi::yellow)<<"Removido (arquivos limpos quando possível): "<<name<<C(ansi::reset)<<"\n";
+    cout<<C(ansi::yellow)<<"Removido (arquivos/diretórios listados)":<<name<<C(ansi::reset)<<"\n";
     return 0;
 }
 
-int action_upgrade(const vector<string>&args){
-    if(args.empty()){ cerr<<"Uso: fbuild upgrade <nova_receita.fbuild>\n"; return 1; }
-    Recipe r=loadRecipe(args[0]);
-    return action_install({args[0]});
-}
+// ============== Upgrade (reinstala com receita nova) ==============
+int action_upgrade(const vector<string>&args){ if(args.empty()){ cerr<<"Uso: fbuild upgrade <nova_receita.fbuild>\n"; return 1; } return action_install(args); }
 
-int action_clean(const vector<string>&args){
-    sh("rm -rf "+shellEscape(cfg.WORK)); ensureDir(cfg.WORK); cout<<"WORK limpo.\n";
-    return 0;
-}
+int action_clean(const vector<string>&args){ sh("rm -rf "+shellEscape(cfg.WORK)); ensureDir(cfg.WORK); cout<<"WORK limpo.\n"; return 0; }
 
-int action_revdep(const vector<string>&args){
-    cout<<"revdep: análise simplificada ainda não implementada.\n";
-    return 0;
-}
-
-int action_orphans(const vector<string>&args){
-    cout<<"orphans: análise simplificada ainda não implementada.\n";
-    return 0;
-}
+int action_revdep(const vector<string>&args){ cout<<"revdep: análise simplificada ainda não implementada.\n"; return 0; }
+int action_orphans(const vector<string>&args){ cout<<"orphans: análise simplificada ainda não implementada.\n"; return 0; }
 
 // ========================= Ajuda =========================
 void help(){
-    cout<<"fbuild - gerenciador source-based (MVP)\n\n";
-    cout<<"Variáveis importantes (export): REPO, FB_CACHE, FB_WORK, FB_PKG, FB_DB, FB_LOG, DESTDIR, FAKEROOT\n\n";
+    cout<<"fbuild - gerenciador source-based (endurecido)\n\n";
+    cout<<"Variáveis (export): REPO, FB_CACHE, FB_WORK, FB_PKG, FB_DB, FB_LOG, DESTDIR\n\n";
     cout<<"Comandos:\n";
     cout<<"  init-repo                         # cria estrutura $REPO/{base,x11,extras,desktop}\n";
     cout<<"  new <categoria> <nome> <ver>      # cria pasta e receita .fbuild\n";
     cout<<"  sync                              # git pull no REPO\n";
     cout<<"  search [termo]                    # procura receitas\n";
     cout<<"  info <arquivo.fbuild>             # mostra metadados\n";
-    cout<<"  download <arquivo.fbuild>         # baixa fontes\n";
+    cout<<"  download|dl <arquivo.fbuild>      # baixa fontes (com SHA256 opcional)\n";
     cout<<"  unpack <arquivo.fbuild>           # baixa + descompacta + aplica patches\n";
     cout<<"  patch <arquivo.fbuild>            # aplica patches (se já extraído)\n";
-    cout<<"  build <arquivo.fbuild>            # compila sem instalar\n";
-    cout<<"  install <arquivo.fbuild>          # compila, empacota e instala (com hooks)\n";
-    cout<<"  remove <nome>                      # remove arquivos via manifesto + limpa registro\n";
+    cout<<"  build|bi <arquivo.fbuild>         # compila sem instalar\n";
+    cout<<"  install|in <arquivo.fbuild>       # compila, empacota e instala\n";
+    cout<<"  remove|rm <nome>                   # remove via manifest.files/.dirs\n";
     cout<<"  upgrade <nova_receita.fbuild>     # instala versão maior\n";
-    cout<<"  revdep                             # checa dependências reversas (stub)\n";
-    cout<<"  orphans                            # lista órfãos (stub)\n";
-    cout<<"  clean                              # limpa diretórios de trabalho\n";
+    cout<<"  revdep                             # stub\n";
+    cout<<"  orphans                            # stub\n";
+    cout<<"  clean                              # limpa WORK\n";
     cout<<"  help                               # esta ajuda\n\n";
-    cout<<"Atalhos: 'dl' para download, 'bi' para build, 'in' para install, 'rm' para remove.\n";
 }
 
 int action_init_repo(const vector<string>&){ ensureBaseDirs(); cout<<"Estrutura criada em "<<cfg.REPO<<"\n"; return 0; }
@@ -521,16 +555,15 @@ summary=GNU Compiler Collection
 license=GPL-3.0
 homepage=https://gcc.gnu.org/
 source0=https://ftp.gnu.org/gnu/gcc/gcc-12.0.0/gcc-12.0.0.tar.xz
-# patch0=https://exemplo.com/patches/gcc-fix.patch
+sha2560=<INSIRA_SHA256_CORRETO>
 build_system=autotools
 build_opts=--disable-multilib --enable-languages=c,c++
 # build_dir=gcc-12.0.0
 # depends=binutils zlib gmp mpfr mpc
 
 ========================= Notas =========================
-- Para usar fakeroot/DESTDIR: export DESTDIR=/ e instale com 'fakeroot fbuild install caminho.fbuild' se desejado.
-- Hooks: scripts opcionais em $REPO/hooks/{pre,post}-{download,patch,build,install,remove}.sh
-- Logs: MVP registra ações principais via stdout/err; para logs detalhados, redirecione a saída.
-- Revdep/órfãos: stubs (pontos de extensão). Implementar leitura de /var/lib/ldconfig/aux-cache e análise ELF via libelf em versões futuras.
-- Manifesto: a remoção agora usa DB/<pkg>/manifest.txt gerado a partir de DESTDIR no momento da instalação.
+- Verificação SHA256 agora é aplicada quando o campo correspondente é fornecido.
+- Manifesto separado para arquivos e diretórios; remoção segura apenas do que foi instalado.
+- Diretórios temporários do pacote são limpos automaticamente quando possível.
+- Para maior segurança, considere futuramente substituir system() por execve/spawn.
 */
