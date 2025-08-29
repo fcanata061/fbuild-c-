@@ -1,0 +1,162 @@
+Tutorial Completo — fbuild (source-based package manager)
+
+1. Instalação
+
+Dependências necessárias
+Antes de usar o fbuild, instale os utilitários básicos:
+
+sudo apt install -y build-essential git curl wget tar xz-utils unzip patch meson ninja-build cmake fakeroot python3 zstd
+
+No LFS ou sistemas minimalistas, você precisa ter ao menos:
+- bash
+- coreutils (cp, mv, rm, mkdir, etc.)
+- tar, xz, gzip, bzip2
+- curl ou wget
+- git
+- fakeroot
+
+Compilar o fbuild:
+
+g++ -std=c++17 -O2 -pthread -o fbuild main.cpp
+
+Coloque o binário em /usr/local/bin ou ~/bin para ficar no PATH.
+
+------------------------------------------------------------
+
+2. Estrutura de diretórios
+
+Quando você cria o repositório (./fbuild init-repo), a árvore padrão fica assim:
+
+fbuild-repo/
+├── base/        # Pacotes essenciais (ex.: gcc, glibc, bash...)
+├── extra/       # Pacotes extras (ex.: firefox, vlc...)
+├── cache/       # Fontes baixados (.tar.gz, .zip...)
+├── work/        # Diretórios temporários de build
+├── pkg/         # Arquivos instalados em staging (fakeroot)
+├── db/          # Banco de dados simples (manifests)
+├── log/         # Logs de build e install
+
+Cada receita vive em um subdiretório, por exemplo:
+
+fbuild-repo/base/gcc-13.2.0/gcc-13.2.0.fbuild
+fbuild-repo/base/glibc-2.40/glibc-2.40.fbuild
+fbuild-repo/extra/firefox-128.0/firefox-128.0.fbuild
+
+------------------------------------------------------------
+
+3. Sintaxe de uma receita .fbuild
+
+Exemplo mínimo:
+
+name=hello
+version=2.12
+release=1
+desc="GNU Hello"
+license=GPL-3.0
+homepage=https://www.gnu.org/software/hello/
+sources=(https://ftp.gnu.org/gnu/hello/hello-2.12.tar.gz)
+sha256=(6d91d7bc5c276f1c99c9e8d2a8e5c6cfe3a24e54631e7a5c45d6efb3f4d8a6f2)
+build=autotools
+depends=(glibc)
+
+Campos suportados:
+- name, version, release, desc, license, homepage
+- sources → URLs de tarballs, zip, git
+- sha256 → checksum de cada source
+- build → autotools, cmake, meson ou custom
+- depends → dependências
+- pre_* e post_* → hooks opcionais
+
+------------------------------------------------------------
+
+4. Comandos do fbuild
+
+./fbuild init-repo                 inicializa repositório vazio
+./fbuild new <section> <pkg> <ver> cria esqueleto de receita
+./fbuild search <nome>             busca por pacotes
+./fbuild info <recipe.fbuild>      mostra info do pacote
+./fbuild build <recipe.fbuild>     compila (workdir, pkgdir)
+./fbuild install <recipe.fbuild>   instala no DESTDIR=/ (usa fakeroot)
+./fbuild remove <nome>             remove pacote instalado
+./fbuild upgrade <recipe.fbuild>   recompila versão mais nova
+
+------------------------------------------------------------
+
+5. Exemplos de receitas completas
+
+5.1. GCC
+Arquivo: fbuild-repo/base/gcc-13.2.0/gcc-13.2.0.fbuild
+
+name=gcc
+version=13.2.0
+release=1
+desc="GNU Compiler Collection"
+license=GPL-3.0
+homepage=https://gcc.gnu.org/
+sources=(https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.xz)
+sha256=(e275e4f1db209ed984b38882fb5a1fd8a604543d3f6d6c6b1341035b1e7985f5)
+build=autotools
+depends=(glibc)
+
+------------------------------------------------------------
+
+5.2. glibc
+Arquivo: fbuild-repo/base/glibc-2.40/glibc-2.40.fbuild
+
+name=glibc
+version=2.40
+release=1
+desc="GNU C Library"
+license=LGPL-2.1
+homepage=https://www.gnu.org/software/libc/
+sources=(https://ftp.gnu.org/gnu/libc/glibc-2.40.tar.xz)
+sha256=(8e4c7e9e2a8a43bbd7a8429476fb4f38a8a0e2ab84b81c3e5d09c9d91bb3df46)
+build=autotools
+depends=()
+
+------------------------------------------------------------
+
+5.3. Firefox
+Arquivo: fbuild-repo/extra/firefox-128.0/firefox-128.0.fbuild
+
+name=firefox
+version=128.0
+release=1
+desc="Mozilla Firefox Web Browser"
+license=MPL-2.0
+homepage=https://www.mozilla.org/firefox/
+sources=(https://archive.mozilla.org/pub/firefox/releases/128.0/source/firefox-128.0.source.tar.xz)
+sha256=(6c2e8f02a25f1f6c7d4f0f9d5f928b36f1ac3cb9346de4aa0f8e08b637f3d98c)
+build=meson
+depends=(glibc gcc)
+
+------------------------------------------------------------
+
+6. Fluxo típico de uso
+
+# Inicializar repositório
+./fbuild init-repo
+
+# Criar receita
+./fbuild new base hello 2.12
+
+# Editar receita .fbuild e ajustar fontes/sha256
+
+# Compilar e instalar
+./fbuild build $REPO/base/hello-2.12/hello-2.12.fbuild
+sudo DESTDIR=/ ./fbuild install $REPO/base/hello-2.12/hello-2.12.fbuild
+
+# Listar pacotes
+ls $REPO/db
+
+# Remover pacote
+sudo DESTDIR=/ ./fbuild remove hello
+
+------------------------------------------------------------
+
+7. Notas finais
+
+- O fbuild não resolve dependências automaticamente (MVP simples). Instale na ordem correta.
+- Logs ficam em log/ e manifests em db/<pkg>/.
+- Você pode adicionar pre_build, post_install, etc. na receita para customizar.
+- Para produção: sempre confira os SHA256.
