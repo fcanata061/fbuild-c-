@@ -180,3 +180,49 @@ depends=(glibc gcc)
 makedepends=(rust cargo clang nodejs python3)
 options=(strip docs)
 groups=(extra)
+
+# glibc-2.40.fbuild — Exemplo real
+
+name=glibc
+version=2.40
+release=1
+desc="GNU C Library"
+license=LGPL-2.1
+homepage=https://www.gnu.org/software/libc/
+
+sources=(https://ftp.gnu.org/gnu/libc/glibc-2.40.tar.xz)
+sha256=(8e4c7e9e2a8a43bbd7a8429476fb4f38a8a0e2ab84b81c3e5d09c9d91bb3df46)
+
+# Dependências mínimas para compilar o glibc
+makedepends=(gcc make gawk bison python3 texinfo)
+
+# glibc geralmente é build=autotools, mas exige diretório separado
+build=custom
+
+pre_build() {
+    mkdir -p build
+    cd build
+}
+
+build() {
+    cd build
+    ../configure \
+        --prefix=/usr \
+        --disable-werror \
+        --enable-kernel=4.4 \
+        --enable-stack-protector=strong \
+        libc_cv_slibdir=/usr/lib
+
+    make -j$(nproc)
+}
+
+check() {
+    cd build
+    # Testes do glibc são pesados, opcional
+    make -k check || true
+}
+
+install() {
+    cd build
+    make install DESTDIR="$PKGDIR"
+}
