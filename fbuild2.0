@@ -1,112 +1,60 @@
-// fbuild - Gerenciador de programas source-based para LFS (versão estendida)
+// fbuild - Gerenciador de programas source-based + binários para LFS
 // Linguagem: C++17
 // Compilação: g++ -std=c++17 -O2 -pthread -o fbuild main.cpp
-// Runtime deps: bash, git, curl, tar, unzip, xz, 7z, patch, zstd, sha256sum, awk, sed, find
+// Dependências (runtime): bash, git, curl, tar, unzip, xz, 7z, patch, zstd, sha256sum, (opcional) fakeroot
 //
-// Implementa:
-//  - sync (múltiplos repositórios: git e http/https)
-//  - upgrade
-//  - orphans (remoção de órfãos)
-//  - search
-//  - hooks (pre/post: download, patch, build, install, remove)
-//  - cache de fontes
-//  - múltiplas versões (via --alt-prefix para /opt/<nome>/<versão>)
-//  - múltiplos repositórios (fbuild.conf com repos=...)
-//  - remoção segura (bloqueia se houver dependentes; --force ignora)
-//  - resolução de dependências evoluída com constraints (=, >=, >, <=, <) e melhor versão
-//  - download por curl/git, patches https/git/dir, extração direta no workdir
+// Recursos principais:
+//  - CLI com subcomandos: init-repo, new, sync, search, info, build, install, remove, upgrade, list, orphans, clean, help
+//  - Flags: -y/--yes, --no-color, --quiet, -j/--jobs, -C/--config, --root, --repo, --cache, --work, --pkg, --db, --log, --pkgroot, --binfmt
+//  - Resolução de dependências (topológica + detecção de ciclo), evita reinstalar o que já está ok
+//  - Download de fontes via curl e git (com cache), extração direta para diretório de trabalho
+//  - Patches via https (arquivos), git (repositórios de patches) e diretórios locais (.patch); aplicação automática
+//  - Build via autotools, cmake, meson, ou comandos custom do recipe
+//  - Instalação via DESTDIR isolado -> empacotamento binário .fbuildpkg -> instalação real a partir do binário
+//  - Confere SHA256 de fontes e de pacotes binários (.fbuildpkg)
+//  - Hooks (globais e locais por receita): pre/post download, patch, build, install, remove
+//  - Manifesto de arquivos e diretórios instalados; remoção segura apenas do listado e diretórios vazios
+//  - Banco simples de instalados com reverse-deps; não remove dependência se houver pacotes dependentes
+//  - Spinner e logs por ação; suporte a múltiplos repositórios (básico), sync (git pull)
+//  - Upgrade: reinstala se versão do recipe for diferente/maior
 //
-// Formato de recipe (.fbuild):
-//   name=nome
-//   version=1.2.3
-//   summary=texto
-//   license=MIT
-//   homepage=https://exemplo
-//   source0=https://...tar.xz | git+https://...repo.git[#tag|@commit]
-//   sha2560=... (opcional, só para fontes não-git)
-//   source1=...
-//   sha2561=...
-//   patch0=https://...patch | git+https://...repo.git | /caminho/do/dir
-//   patch1=...
-//   build_system=autotools|cmake|meson (default autotools)
-//   build_opts=... (passado ao configure/cmake/meson)
-//   pre_build=... (comando shell)
-//   build=... (comando shell; ignora build_system se setado)
-//   install=... (comando shell; ignora build_system se setado)
-//   build_dir=. (subpasta dentro do workdir onde compila)
-//   depends=pkgA>=1.2 pkgB=2.0 pkgC
+// Observações de segurança:
+//  - Para simplicidade, utiliza system()/bash -lc com escapes. Em produção, considere spawn/execve.
+//  - fakeroot é usado apenas no empacotamento; instalação final no root de destino pode requerer privilégios.
 //
-// Config: ~/.config/fbuild/fbuild.conf
-//   repos=git+https://github.com/voce/fbuild-recipes.git,https://meu.site/recipes.tar.gz
-//   destdir=/      (raiz de instalação)
-//   jobs=0         (0 = auto pela CPU)
-//   cache_dir=~/.cache/fbuild
-//   work_dir=~/.local/share/fbuild/work
-//   pkg_dir=~/.local/share/fbuild/pkg
-//   db_dir=~/.local/share/fbuild/db
-//   log_dir=~/.local/share/fbuild/log
-//
-// CLI (atalhos):
-//   fbuild help
-//   fbuild init-repo
-//   fbuild sync
-//   fbuild search <termo>
-//   fbuild info <arquivo.fbuild>
-//   fbuild download|dl <arquivo.fbuild>
-//   fbuild unpack <arquivo.fbuild>
-//   fbuild patch <arquivo.fbuild>
-//   fbuild build|bi <arquivo.fbuild> [--alt-prefix /opt/<nome>/<versao>] [--jobs N]
-//   fbuild install|in <arquivo.fbuild> [--alt-prefix ...] [--jobs N] [--force]
-//   fbuild remove|rm <nome> [--version X.Y.Z] [--force]
-//   fbuild upgrade [<nome>...]           # sem args: todos instalados
-//   fbuild orphans [--remove]            # lista órfãos; --remove remove
-//   fbuild clean
-//
-// Notas de segurança:
-//  - Usa system()/bash -lc por simplicidade; comandos devidamente escapados.
-//  - Não remove nada fora do manifesto.
-//  - Apenas remove diretórios vazios e listados no manifesto.
-//  - Remoção segura: bloqueia remover pacote com dependentes, a menos que --force.
-//
-// ------------------------------------------------------------
-
+// ========================= INCLUDES =========================
 #include <bits/stdc++.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <filesystem>
-#include <atomic>
-#include <thread>
 
 using namespace std;
 namespace fs = std::filesystem;
 
-// ========================= ANSI & Util =========================
+// ========================= ANSI / UX =========================
 namespace ansi {
-    const string reset="\033[0m";
-    const string bold="\033[1m";
-    const string dim="\033[2m";
-    const string red="\033[31m";
-    const string green="\033[32m";
-    const string yellow="\033[33m";
-    const string blue="\033[34m";
-    const string magenta="\033[35m";
-    const string cyan="\033[36m";
-    const string gray="\033[90m";
+    const string reset  = "\033[0m";
+    const string bold   = "\033[1m";
+    const string dim    = "\033[2m";
+    const string red    = "\033[31m";
+    const string green  = "\033[32m";
+    const string yellow = "\033[33m";
+    const string blue   = "\033[34m";
+    const string magenta= "\033[35m";
+    const string cyan   = "\033[36m";
+    const string gray   = "\033[90m";
 }
 
 static bool verbose = true;
 static bool no_color = false;
+static bool assume_yes = false;
+static int  global_jobs = max(1u, thread::hardware_concurrency());
+static string global_binfmt = "zst"; // formato de compressão do .fbuildpkg: zst ou gz
 
-string C(string color){ return no_color? string("") : color; }
+string C(const string &color){ return no_color? string("") : color; }
 
-string trim(const string &s){ size_t a=s.find_first_not_of(" \t\r\n"); if(a==string::npos) return ""; size_t b=s.find_last_not_of(" \t\r\n"); return s.substr(a,b-a+1);}    
-vector<string> split(const string& s, char sep) {
-    vector<string> out; string cur; stringstream ss(s); while(getline(ss, cur, sep)) out.push_back(trim(cur)); return out;
-}
-bool startsWith(const string& s, const string& p){ return s.rfind(p,0)==0; }
-bool endsWith(const string& s, const string& suf){ if(s.size()<suf.size()) return false; return s.compare(s.size()-suf.size(), suf.size(), suf)==0; }
-
+// ========================= Helpers gerais =========================
 string shellEscape(const string &s){
     string out; out.reserve(s.size()*2);
     for(unsigned char c: s){
@@ -116,21 +64,41 @@ string shellEscape(const string &s){
     return out;
 }
 
+bool existsPath(const string &p){ return access(p.c_str(), F_OK)==0; }
+
+string getenvs(const string &k, const string &def=""){ const char* v=getenv(k.c_str()); return v? string(v):def; }
+
+string joinPath(const string &a, const string &b){ if(a.empty()) return b; if(a.back()=='/') return a+b; return a+"/"+b; }
+
+string timestamp(){ time_t t=time(nullptr); char buf[64]; strftime(buf,64,"%Y-%m-%d_%H-%M-%S",localtime(&t)); return buf; }
+
+void ensureDir(const string &p){ if(!existsPath(p)) { if(mkdir(p.c_str(), 0755)!=0){ perror(("mkdir "+p).c_str()); exit(1);} } }
+
+// executar comando (opcionalmente logando em arquivo)
 int sh(const string &cmd, const string &logfile=""){
     if(verbose) cerr << C(ansi::gray) << "→ " << cmd << C(ansi::reset) << "\n";
-    string real = cmd;
     if(!logfile.empty()){
-        string wrapped = "bash -lc '" + cmd + "' >>" + shellEscape(logfile) + " 2>&1";
-        return system(wrapped.c_str());
+        string real = "bash -lc '" + cmd + "' >>" + shellEscape(logfile) + " 2>&1";
+        return system(real.c_str());
     }
     return system(cmd.c_str());
 }
-bool existsPath(const string &p){ return access(p.c_str(), F_OK)==0; }
-string getenvs(const string &k, const string &def=""){ const char* v=getenv(k.c_str()); return v? string(v):def; }
-string joinPath(const string &a, const string &b){ if(a.empty()) return b; if(a.back()=='/') return a+b; return a+"/"+b; }
-string timestamp(){ time_t t=time(nullptr); char buf[64]; strftime(buf,64,"%Y-%m-%d_%H-%M-%S",localtime(&t)); return buf; }
-void ensureDir(const string &p){ if(!existsPath(p)) { if(mkdir(p.c_str(), 0755)!=0){ perror(("mkdir "+p).c_str()); exit(1);} } }
+
+// ler saída de comando (1a linha)
+string shOut1(const string &cmd){
+    string c = "bash -lc '"+cmd+"'";
+    FILE* pipe=popen(c.c_str(),"r"); if(!pipe) return "";
+    char buf[4096]; string out;
+    if(fgets(buf,sizeof(buf),pipe)) out = string(buf);
+    pclose(pipe);
+    // trim
+    while(!out.empty() && (out.back()=='\n'||out.back()=='\r')) out.pop_back();
+    return out;
+}
+
+// Verifica se binário está no PATH
 bool haveCmd(const string &cmd){ string c = "bash -lc 'command -v "+shellEscape(cmd)+" >/dev/null'"; return system(c.c_str())==0; }
+
 void requireCmds(const vector<string>&cmds){
     vector<string> missing;
     for(auto &c:cmds){ if(!haveCmd(c)) missing.push_back(c); }
@@ -149,245 +117,92 @@ public:
     void start(const string &m){ msg=m; running=true; th=thread([&]{
         const char* frames="|/-\\"; int i=0;
         while(running){ cerr << "\r" << C(ansi::cyan) << frames[i++%4] << C(ansi::reset) << " " << msg << "   "; cerr.flush(); this_thread::sleep_for(chrono::milliseconds(100)); }
-        cerr << "\r" << string(msg.size()+4,' ') << "\r"; cerr.flush();
+        cerr << "\r" << string(msg.size()+8,' ') << "\r"; cerr.flush();
     }); }
     void stopOk(){ running=false; if(th.joinable()) th.join(); cerr << C(ansi::green) << "✔" << C(ansi::reset) << " " << msg << "\n"; }
     void stopFail(){ running=false; if(th.joinable()) th.join(); cerr << C(ansi::red) << "✖" << C(ansi::reset) << " " << msg << "\n"; }
 };
 
-// ========================= Versão & Comparação =========================
-int cmpVersion(const string& a, const string& b){
-    // compara por números separados por . e letras como sufixo
-    auto tok = [](const string& s){ vector<long long> v; string t; for(size_t i=0;i<=s.size();++i){ if(i==s.size()||s[i]=='.'){ v.push_back(atoll(t.c_str())); t.clear(); } else if(isdigit((unsigned char)s[i])) t.push_back(s[i]); } return v; };
-    vector<long long> A=tok(a), B=tok(b);
-    size_t n=max(A.size(),B.size());
-    for(size_t i=0;i<n;i++){
-        long long x = i<A.size()?A[i]:0;
-        long long y = i<B.size()?B[i]:0;
-        if(x<y) return -1; if(x>y) return 1;
-    }
-    // se empatar, comprimento como desempate (ex: 1.2 < 1.2.1)
-    if(A.size()<B.size()) return -1;
-    if(A.size()>B.size()) return 1;
-    return 0;
-}
-struct Constraint{
-    string name, op, ver; // ex: mpfr >= 4.2.0
-};
-Constraint parseConstraint(const string& token){
-    // aceita: nome, nome=1.2, nome>=1.2, nome<=1.2, nome>1.2, nome<1.2
-    Constraint c; string t=token;
-    auto pos = t.find_first_of("<>=");
-    if(pos==string::npos){ c.name=t; return c; }
-    c.name = trim(t.substr(0,pos));
-    if(t.substr(pos,2)=="<="||t.substr(pos,2)==">="){ c.op=t.substr(pos,2); c.ver=trim(t.substr(pos+2)); }
-    else { c.op=t.substr(pos,1); c.ver=trim(t.substr(pos+1)); }
-    return c;
-}
-bool versionSatisfies(const string& have, const Constraint& c){
-    if(c.op.empty()) return true;
-    int k = cmpVersion(have, c.ver);
-    if(c.op=="=") return k==0;
-    if(c.op==">") return k>0;
-    if(c.op==">=") return k>=0;
-    if(c.op=="<") return k<0;
-    if(c.op=="<=") return k<=0;
-    return false;
-}
-
-// ========================= Config & Paths =========================
+// ========================= Configuração =========================
 struct Config{
-    string HOME = getenvs("HOME");
-    string CONF = getenvs("XDG_CONFIG_HOME", getenvs("HOME")+"/.config")+"/fbuild/fbuild.conf";
-    string REPOS_ROOT = getenvs("HOME")+"/.local/share/fbuild/repos"; // onde os recipes ficam sincronizados
-    string CACHE = getenvs("FB_CACHE", getenvs("HOME")+"/.cache/fbuild");
-    string WORK = getenvs("FB_WORK", getenvs("HOME")+"/.local/share/fbuild/work");
-    string PKG = getenvs("FB_PKG", getenvs("HOME")+"/.local/share/fbuild/pkg");
-    string DB = getenvs("FB_DB", getenvs("HOME")+"/.local/share/fbuild/db");
-    string LOG = getenvs("FB_LOG", getenvs("HOME")+"/.local/share/fbuild/log");
-    string DESTDIR = getenvs("DESTDIR", "/"); // raiz alvo por padrão
-    int JOBS = 0; // 0 = auto
-    vector<string> REPO_URLS; // múltiplos repos
+    // Diretórios principais (padrões podem ser sobrescritos por env/flags)
+    string REPO   = getenvs("REPO", string(getenvs("HOME"))+"/fbuild-repo");
+    string CACHE  = getenvs("FB_CACHE", string(getenvs("HOME"))+"/.cache/fbuild");
+    string WORK   = getenvs("FB_WORK",  string(getenvs("HOME"))+"/.local/share/fbuild/work");
+    string PKG    = getenvs("FB_PKG",   string(getenvs("HOME"))+"/.local/share/fbuild/pkg"); // legacy (manifest local)
+    string DB     = getenvs("FB_DB",    string(getenvs("HOME"))+"/.local/share/fbuild/db");
+    string LOG    = getenvs("FB_LOG",   string(getenvs("HOME"))+"/.local/share/fbuild/log");
+    string DESTROOT = getenvs("DESTDIR", "/"); // raiz alvo final (instalação real)
+
+    // Raiz onde ficam os binários .fbuildpkg (cache binário)
+    string PKGROOT = getenvs("FBUILD_PKGROOT", string(getenvs("HOME"))+"/.local/share/fbuild/pkgroot"); // bin/
+    // Raiz de build DESTDIR dos pacotes (árvore ROOT simulada)
+    string BUILDROOT = getenvs("FBUILD_BUILDROOT", string(getenvs("HOME"))+"/.local/share/fbuild/buildroot");
 } cfg;
 
 void ensureBaseDirs(){
-    for(auto &d: {cfg.REPOS_ROOT, cfg.CACHE, cfg.WORK, cfg.PKG, cfg.DB, cfg.LOG}) ensureDir(d);
+    for(auto &d: {cfg.REPO, cfg.CACHE, cfg.WORK, cfg.PKG, cfg.DB, cfg.LOG, cfg.PKGROOT, cfg.BUILDROOT}) ensureDir(d);
+    for(auto &sub: {string("base"),string("x11"),string("extras"),string("desktop"),string("hooks")}) ensureDir(joinPath(cfg.REPO, sub));
+    ensureDir(joinPath(cfg.PKGROOT,"bin")); // onde ficam os .fbuildpkg
 }
 
-void loadConfig(){
-    ensureBaseDirs();
-    ifstream in(cfg.CONF);
-    if(!in) return;
-    string line;
-    while(getline(in,line)){
-        line=trim(line);
-        if(line.empty()||line[0]=='#') continue;
-        auto eq=line.find('=');
-        if(eq==string::npos) continue;
-        string k=trim(line.substr(0,eq)), v=trim(line.substr(eq+1));
-        if(k=="repos"){
-            auto vs=split(v,',');
-            for(auto& u: vs) if(!u.empty()) cfg.REPO_URLS.push_back(u);
-        } else if(k=="destdir"){
-            cfg.DESTDIR=v.empty()? cfg.DESTDIR: v;
-        } else if(k=="jobs"){
-            cfg.JOBS = atoi(v.c_str());
-        } else if(k=="cache_dir"){ cfg.CACHE=v; }
-        else if(k=="work_dir"){ cfg.WORK=v; }
-        else if(k=="pkg_dir"){ cfg.PKG=v; }
-        else if(k=="db_dir"){ cfg.DB=v; }
-        else if(k=="log_dir"){ cfg.LOG=v; }
-    }
-}
-
-// ========================= Recipe =========================
+// ========================= Formato de receita =========================
 struct Recipe{
     string path;
     map<string,string> kv;
     vector<string> sources;
     vector<string> sha256;
     vector<string> patches;
-    vector<Constraint> depends;
+    vector<string> depends;
 };
-string recipeName(const Recipe &r){ auto it=r.kv.find("name"); return it==r.kv.end()?"":it->second; }
-string recipeVersion(const Recipe &r){ auto it=r.kv.find("version"); return it==r.kv.end()?"":it->second; }
-string workDir(const Recipe &r){ return joinPath(cfg.WORK, recipeName(r)+"-"+recipeVersion(r)); }
-string buildDir(const Recipe &r){ string bd = r.kv.count("build_dir")? r.kv.at("build_dir"): string("."); return joinPath(workDir(r), bd); }
-string pkgTar(const Recipe &r){ return joinPath(cfg.PKG, recipeName(r)+"-"+recipeVersion(r)+".tar.zst"); }
-string dbDir(const string &name, const string& ver){ return joinPath(cfg.DB, name+"@"+ver); }
-string manifestFilesPath(const string &name,const string& ver){ return joinPath(dbDir(name,ver), "manifest.files"); }
-string manifestDirsPath(const string &name,const string& ver){ return joinPath(dbDir(name,ver), "manifest.dirs"); }
 
-Recipe loadRecipeFile(const string &file){
+string trim(const string &s){ size_t a=s.find_first_not_of(" \t\r\n"); if(a==string::npos) return ""; size_t b=s.find_last_not_of(" \t\r\n"); return s.substr(a,b-a+1);}    
+
+bool isGitUrl(const string &url){
+    if(url.rfind("git://",0)==0) return true;
+    if(url.rfind("git@",0)==0) return true;
+    if(url.rfind("https://",0)==0 || url.rfind("http://",0)==0){
+        if(url.size()>4 && url.find(".git")!=string::npos) return true;
+    }
+    return false;
+}
+
+Recipe loadRecipe(const string &file){
     ifstream in(file); if(!in) { cerr<<C(ansi::red)<<"Erro abrindo receita: "<<file<<C(ansi::reset)<<"\n"; exit(1);}    
     Recipe r; r.path=file; string line; 
     while(getline(in,line)){
-        line=trim(line); if(line.empty()||line[0]=='#') continue;
+        line=trim(line); if(line.empty()||line[0]=='#'||line[0]=='[') continue;
         auto eq=line.find('='); if(eq==string::npos) continue; string k=trim(line.substr(0,eq)); string v=trim(line.substr(eq+1));
         if(k.rfind("source",0)==0){ r.sources.push_back(v); }
         else if(k.rfind("sha256",0)==0){ r.sha256.push_back(v); }
         else if(k.rfind("patch",0)==0){ r.patches.push_back(v); }
-        else if(k=="depends"){
-            stringstream ss(v); string x; while(ss>>x) r.depends.push_back(parseConstraint(x));
-        } else r.kv[k]=v;
-    }
-    if(recipeName(r).empty()||recipeVersion(r).empty()){
-        cerr<<C(ansi::red)<<"Receita inválida (name/version ausentes): "<<file<<C(ansi::reset)<<"\n"; exit(1);
+        else if(k=="depends"){ stringstream ss(v); string x; while(ss>>x) r.depends.push_back(x); }
+        else r.kv[k]=v;
     }
     return r;
 }
 
-// ========================= Índice de recipes (múltiplos repositórios) =========================
-struct RecipeIndexEntry{
-    string name;
-    string version;
-    string file; // caminho do .fbuild
-};
-struct RecipeIndex{
-    // name -> lista de versões disponíveis (um por repositório)
-    map<string, vector<RecipeIndexEntry>> entries;
-};
-bool isFbuild(const fs::path& p){ return p.extension()==".fbuild"; }
-
-RecipeIndex buildRecipeIndex(){
-    RecipeIndex idx;
-    // Cada repositório fica em cfg.REPOS_ROOT/<hash da url ou nome derivado>
-    // Vamos considerar que sync já populou subpastas; aqui só varremos .fbuild
-    for(auto& d: fs::directory_iterator(cfg.REPOS_ROOT)){
-        if(!d.is_directory()) continue;
-        for(auto& p: fs::recursive_directory_iterator(d.path())){
-            if(!p.is_regular_file()) continue;
-            if(!isFbuild(p.path())) continue;
-            // leitura superficial do arquivo para obter name/version rapidamente
-            ifstream in(p.path()); if(!in) continue;
-            string line, name, version;
-            while(getline(in,line)){
-                line=trim(line); if(line.empty()||line[0]=='#') continue;
-                auto eq=line.find('=');
-                if(eq==string::npos) continue;
-                string k=trim(line.substr(0,eq)), v=trim(line.substr(eq+1));
-                if(k=="name") name=v;
-                else if(k=="version"){ version=v; break; }
-            }
-            if(!name.empty() && !version.empty()){
-                idx.entries[name].push_back({name,version,p.path().string()});
-            }
-        }
-    }
-    // ordenar versões por preferência (maior primeiro)
-    for(auto& kv: idx.entries){
-        auto& vec = kv.second;
-        sort(vec.begin(), vec.end(), [](const RecipeIndexEntry& a, const RecipeIndexEntry& b){
-            int c = cmpVersion(a.version, b.version);
-            return c>0; // desc
-        });
-    }
-    return idx;
+string recipeName(const Recipe &r){ auto it=r.kv.find("name"); return it==r.kv.end()?"":it->second; }
+string recipeVersion(const Recipe &r){ auto it=r.kv.find("version"); return it==r.kv.end()?"":it->second; }
+string recipeBuildSys(const Recipe &r){ auto it=r.kv.find("build_system"); return it==r.kv.end()?"autotools":it->second; }
+string workDir(const Recipe &r){ return joinPath(cfg.WORK, recipeName(r)+"-"+recipeVersion(r)); }
+string buildDir(const Recipe &r){ string bd = r.kv.count("build_dir")? r.kv.at("build_dir"): string("."); return joinPath(workDir(r), bd); }
+string pkgTarPath(const Recipe &r){ // pacote binário local (apenas nome base sugerido)
+    string arch = shOut1("uname -m");
+    string pkgname = recipeName(r)+"-"+recipeVersion(r)+"-"+arch+".fbuildpkg";
+    return joinPath(joinPath(cfg.PKGROOT,"bin"), pkgname);
 }
+string dbDir(const Recipe &r){ return joinPath(cfg.DB, recipeName(r)); }
+string manifestFilesPath(const Recipe &r){ return joinPath(dbDir(r), "manifest.files"); }
+string manifestDirsPath(const Recipe &r){ return joinPath(dbDir(r), "manifest.dirs"); }
+string metaPath(const Recipe &r){ return joinPath(dbDir(r), "meta"); }
+string reverseDepsPath(){ return joinPath(cfg.DB, "_reverse_deps"); } // formato simples: dep -> [list of rdeps]
 
-optional<RecipeIndexEntry> selectRecipe(const RecipeIndex& idx, const Constraint& want){
-    auto it = idx.entries.find(want.name);
-    if(it==idx.entries.end()) return {};
-    // escolher a primeira versão que satisfaça a constraint
-    for(const auto& e : it->second){
-        if(versionSatisfies(e.version, want)) return e;
-    }
-    return {}; // nenhuma satisfaz
-}
-
-// ========================= Download / Extração / Verificação =========================
-static inline bool isGitUrl(const string &url){
-    if(startsWith(url,"git+")) return true;
-    if(startsWith(url,"git@")) return true;
-    if(startsWith(url,"git://")) return true;
-    if((startsWith(url,"https://")||startsWith(url,"http://")) && url.find(".git")!=string::npos) return true;
-    return false;
-}
-string stripGitPrefix(string u){ if(startsWith(u,"git+")) return u.substr(4); return u; }
-
-int fetchHttp(const string &url, const string &out){
-    return sh("curl -L --fail --retry 3 -o "+shellEscape(out)+" "+shellEscape(url));
-}
-int fetchGit(const string &url, const string &out){
-    // suporta '#tag' ou '@commit' no final
-    string u = stripGitPrefix(url);
-    string ref;
-    string base=u;
-    size_t pos=u.find('#');
-    size_t pos2=u.find('@');
-    if(pos!=string::npos){ ref="--branch "+shellEscape(u.substr(pos+1)); base=u.substr(0,pos); }
-    else if(pos2!=string::npos){ // commit
-        base=u.substr(0,pos2); ref=""; // checkout depois
-    }
-    int rc = sh("git clone --depth 1 "+ref+" "+shellEscape(base)+" "+shellEscape(out));
-    if(rc!=0) return rc;
-    if(pos2!=string::npos){
-        string commit = u.substr(pos2+1);
-        rc = sh("bash -lc 'cd "+shellEscape(out)+" && git fetch --depth 1 origin "+shellEscape(commit)+" && git checkout "+shellEscape(commit)+"'");
-    }
-    return rc;
-}
-
-int extractArchive(const string &archive, const string &dest){
-    string a=archive; 
-    if(endsWith(a,".zip")) return sh("unzip -q "+shellEscape(a)+" -d "+shellEscape(dest));
-    if(a.find(".tar.")!=string::npos) return sh("tar -xf "+shellEscape(a)+" -C "+shellEscape(dest));
-    if(endsWith(a,".tar")||endsWith(a,".tgz")||endsWith(a,".txz")||endsWith(a,".tbz2")) return sh("tar -xf "+shellEscape(a)+" -C "+shellEscape(dest));
-    if(endsWith(a,".xz")||endsWith(a,".gz")||endsWith(a,".bz2")) {
-        // tenta tar -xf; se falhar, usar 7z como fallback
-        int rc = sh("tar -xf "+shellEscape(a)+" -C "+shellEscape(dest));
-        if(rc==0) return 0;
-    }
-    // fallback 7z
-    return sh("7z x "+shellEscape(a)+" -o"+shellEscape(dest));
-}
-
-bool verifySha256(const string &file, const string &expected){
-    if(expected.empty()) return true; // nada a verificar
-    string cmd = "bash -lc 'sha256sum " + shellEscape(file) + " | awk \"{print $1}\"'";
-    FILE* pipe=popen(cmd.c_str(), "r"); if(!pipe) return false; char buf[256]; string got;
-    if(fgets(buf,sizeof(buf),pipe)) got = trim(string(buf));
-    pclose(pipe);
+// ========================= SHA256 =========================
+bool verifySha256File(const string &file, const string &expected){
+    if(expected.empty()) return true;
+    string cmd = "sha256sum " + shellEscape(file) + " | awk '{print $1}'";
+    string got = shOut1(cmd);
     if(got.empty()) return false;
     if(got!=expected){
         cerr<<C(ansi::red)<<"SHA256 divergente: esperado="<<expected<<" obtido="<<got<<C(ansi::reset)<<"\n";
@@ -396,67 +211,89 @@ bool verifySha256(const string &file, const string &expected){
     return true;
 }
 
-// Baixa todas as sources da receita pro CACHE e extrai no workdir
-int downloadSources(const Recipe &r){
+string sha256OfFile(const string &file){
+    string cmd = "sha256sum " + shellEscape(file) + " | awk '{print $1}'";
+    return shOut1(cmd);
+}
+
+// ========================= Download & Extração =========================
+int fetchOne(const string &url, const string &out){
+    if(isGitUrl(url)){
+        return sh("git clone --depth 1 "+shellEscape(url)+" "+shellEscape(out));
+    } else {
+        return sh("curl -L --fail --retry 3 -o "+shellEscape(out)+" "+shellEscape(url));
+    }
+}
+
+int extractTo(const string &archive, const string &dest){
+    string a=archive; 
+    // zip
+    if(a.size()>4 && a.substr(a.size()-4)==".zip") return sh("unzip -q "+shellEscape(a)+" -d "+shellEscape(dest));
+    // tar.* (xz, gz, bz2, zst)
+    if(a.find(".tar.")!=string::npos) return sh("tar -xf "+shellEscape(a)+" -C "+shellEscape(dest));
+    // plain .xz / .gz (assumimos tar comprimido)
+    if(a.size()>3 && (a.substr(a.size()-3)==".xz" || a.substr(a.size()-3)==".gz" || a.substr(a.size()-3)==".bz2")) return sh("tar -xf "+shellEscape(a)+" -C "+shellEscape(dest));
+    // fallback 7z
+    return sh("7z x "+shellEscape(a)+" -o"+shellEscape(dest));
+}
+
+int downloadSources(const Recipe &r, string &outDir){
     // Limpa workdir anterior
     if(existsPath(workDir(r))) sh("rm -rf "+shellEscape(workDir(r)));
     ensureDir(workDir(r));
 
     for(size_t i=0;i<r.sources.size();++i){
         string url=r.sources[i];
-        string cacheTarget = joinPath(cfg.CACHE, recipeName(r)+"-"+recipeVersion(r)+"-src"+to_string(i));
         if(isGitUrl(url)){
-            // cache: clona para cache e copia para work
-            string cachedGit = cacheTarget + ".gitrepo";
-            if(existsPath(cachedGit)) sh("rm -rf "+shellEscape(cachedGit));
-            if(fetchGit(url, cachedGit)!=0) return 1;
             string dest = joinPath(workDir(r), string("src")+to_string(i)); ensureDir(dest);
-            int rc = sh("bash -lc 'cp -a "+shellEscape(cachedGit)+"/. "+shellEscape(dest)+"/'");
+            int rc = sh("git clone --depth 1 "+shellEscape(url)+" "+shellEscape(dest));
             if(rc!=0) return rc;
         } else {
-            // se já existe no cache com checksum ok, não baixa de novo
-            bool need = true;
-            if(existsPath(cacheTarget)){
-                string expect = (i<r.sha256.size()? r.sha256[i]: string(""));
-                if(verifySha256(cacheTarget, expect)) need=false;
-            }
-            if(need){
-                if(fetchHttp(url, cacheTarget)!=0) return 1;
-                string expect = (i<r.sha256.size()? r.sha256[i]: string(""));
-                if(!verifySha256(cacheTarget, expect)) return 100;
-            }
-            int rc = extractArchive(cacheTarget, workDir(r)); if(rc!=0) return rc;
+            string cacheTarget = joinPath(cfg.CACHE, recipeName(r)+"-"+recipeVersion(r)+"-src"+to_string(i));
+            int rc = fetchOne(url, cacheTarget); if(rc!=0) return rc;
+            string expected = (i<r.sha256.size()? r.sha256[i]: string(""));
+            if(!verifySha256File(cacheTarget, expected)) return 100; // checksum errado
+            rc = extractTo(cacheTarget, workDir(r)); if(rc!=0) return rc;
         }
     }
+    outDir = workDir(r);
     return 0;
 }
 
-int applyPatchPath(const string &patchPath, const string &dest){
+// Aplicação de patches (https, git, diretório local, arquivo local)
+int applyPatchFile(const string &patchPath, const string &dest){
     return sh("patch -p1 -d "+shellEscape(dest)+" < "+shellEscape(patchPath));
 }
+
 int applyPatches(const Recipe &r){
     string wd = workDir(r);
+    // patches declarados
     for(auto &p : r.patches){
         string path=p;
-        if(startsWith(p,"http://")||startsWith(p,"https://")){
+        if(p.rfind("http://",0)==0 || p.rfind("https://",0)==0){
             string tmp = joinPath(cfg.CACHE, string("patch-")+to_string(hash<string>{}(p)));
-            if(fetchHttp(p,tmp)!=0) return 1; 
-            if(applyPatchPath(tmp, wd)!=0) return 1;
+            if(fetchOne(p,tmp)!=0) return 1; path=tmp;
+            if(applyPatchFile(path, wd)!=0) return 1;
         } else if(isGitUrl(p)){
-            string tmpdir = joinPath(cfg.CACHE, string("patchrepo-")+to_string(hash<string>{}(p))); 
-            if(existsPath(tmpdir)) sh("rm -rf "+shellEscape(tmpdir)); 
-            ensureDir(tmpdir);
-            if(fetchGit(p,tmpdir)!=0) return 1;
+            string tmpdir = joinPath(cfg.CACHE, string("patchrepo-")+to_string(hash<string>{}(p))); if(existsPath(tmpdir)) sh("rm -rf "+shellEscape(tmpdir)); ensureDir(tmpdir);
+            if(sh("git clone --depth 1 "+shellEscape(p)+" "+shellEscape(tmpdir))!=0) return 1;
             string cmd = "bash -lc 'shopt -s nullglob; for f in " + shellEscape(tmpdir) + "/*.patch; do patch -p1 -d " + shellEscape(wd) + " < \"$f\"; done'";
             if(sh(cmd)!=0) return 1; 
-        } else if(existsPath(p) && fs::is_directory(p)){
-            string cmd = "bash -lc 'shopt -s nullglob; for f in " + shellEscape(p) + "/*.patch; do patch -p1 -d " + shellEscape(wd) + " < \"$f\"; done'";
-            if(sh(cmd)!=0) return 1;
         } else {
-            if(applyPatchPath(path, wd)!=0) return 1;
+            // arquivo local individual
+            if(fs::is_regular_file(path)){
+                if(applyPatchFile(path, wd)!=0) return 1;
+            } else if(fs::is_directory(path)){
+                // diretório local de patches
+                string cmd = "bash -lc 'shopt -s nullglob; for f in " + shellEscape(path) + "/*.patch; do patch -p1 -d " + shellEscape(wd) + " < \"$f\"; done'";
+                if(sh(cmd)!=0) return 1;
+            } else {
+                cerr<<C(ansi::yellow)<<"Aviso: patch não encontrado: "<<path<<C(ansi::reset)<<"\n";
+                return 1;
+            }
         }
     }
-    // patches locais do diretório da receita
+    // patches locais do diretório da receita (./patches/*.patch)
     string pdir = joinPath(fs::path(r.path).parent_path().string(), "patches");
     if(existsPath(pdir)){
         string cmd = "bash -lc 'shopt -s nullglob; for f in " + shellEscape(pdir) + "/*.patch; do patch -p1 -d " + shellEscape(wd) + " < \"$f\"; done'";
@@ -466,27 +303,27 @@ int applyPatches(const Recipe &r){
 }
 
 // ========================= Hooks =========================
+// Hooks globais: $REPO/hooks/<hook>.sh
+// Hooks locais por receita: <dir_da_receita>/hooks/<hook>.sh
+// Hooks suportados: pre-download, post-download, pre-patch, post-patch, pre-build, post-build, pre-install, post-install, pre-remove, post-remove
 void runHook(const string &hook, const Recipe &r){
-    // busca script em qualquer repo sincronizado dentro de <repo>/hooks/<hook>.sh
-    for(auto& d: fs::directory_iterator(cfg.REPOS_ROOT)){
-        string script = joinPath(joinPath(d.path().string(),"hooks"), hook+".sh");
+    vector<string> candidates;
+    candidates.push_back(joinPath(joinPath(cfg.REPO,"hooks"), hook+".sh"));
+    candidates.push_back(joinPath(joinPath(fs::path(r.path).parent_path().string(),"hooks"), hook+".sh"));
+
+    for(const string &script: candidates){
         if(existsPath(script)) {
             string cmd = "bash -lc '"+shellEscape(script)+" "+shellEscape(recipeName(r))+" "+shellEscape(recipeVersion(r))+"'";
             sh(cmd);
         }
     }
-    // Hook inline por recipe? (chave hook_<name>=comando)
-    string key = "hook_"+hook;
-    if(r.kv.count(key)){
-        sh("bash -lc '"+r.kv.at(key)+"'");
-    }
 }
 
-// ========================= Build & Install =========================
-int runBuildSystem(const Recipe &r, int jobs){
-    string bs = r.kv.count("build_system")? r.kv.at("build_system"):"autotools";
+// ========================= Build & Install (DESTDIR) =========================
+int runBuildSystem(const Recipe &r){
+    string bs = recipeBuildSys(r);
     string dir = buildDir(r);
-    int njobs = jobs>0? jobs: (int)max(1u, thread::hardware_concurrency());
+    int jobs = global_jobs;
 
     if(r.kv.count("pre_build")){
         if(sh("bash -lc 'cd "+shellEscape(dir)+" && "+r.kv.at("pre_build")+"'" ) != 0) return 1;
@@ -495,99 +332,126 @@ int runBuildSystem(const Recipe &r, int jobs){
         return sh("bash -lc 'cd "+shellEscape(dir)+" && "+r.kv.at("build")+"' ");
     }
     if(bs=="autotools"){
-        string opts = r.kv.count("build_opts")? r.kv.at("build_opts"): string("");
-        return sh("bash -lc 'cd "+shellEscape(dir)+" && ./configure --prefix=/usr "+opts+" && make -j"+to_string(njobs)+"' ");
+        return sh("bash -lc 'cd "+shellEscape(dir)+" && ./configure --prefix=/usr "+(r.kv.count("build_opts")?r.kv.at("build_opts"):string(""))+" && make -j"+to_string(jobs)+"' ");
     } else if(bs=="cmake"){
-        string opts = r.kv.count("build_opts")? r.kv.at("build_opts"): string("");
-        return sh("bash -lc 'cd "+shellEscape(dir)+" && cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr "+opts+" && cmake --build build -j"+to_string(njobs)+"' ");
+        return sh("bash -lc 'cd "+shellEscape(dir)+" && cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr "+(r.kv.count("build_opts")?r.kv.at("build_opts"):string(""))+" && cmake --build build -j"+to_string(jobs)+"' ");
     } else if(bs=="meson"){
-        string opts = r.kv.count("build_opts")? r.kv.at("build_opts"): string("");
-        return sh("bash -lc 'cd "+shellEscape(dir)+" && meson setup build --prefix=/usr "+opts+" && meson compile -C build' ");
+        return sh("bash -lc 'cd "+shellEscape(dir)+" && meson setup build --prefix=/usr "+(r.kv.count("build_opts")?r.kv.at("build_opts"):string(""))+" && meson compile -C build' ");
     }
     return 1;
 }
 
-int runInstall(const Recipe &r, const string &destdir){
-    string bs = r.kv.count("build_system")? r.kv.at("build_system"):"autotools";
+int runInstallDestdir(const Recipe &r, const string &destroot){
+    string bs = recipeBuildSys(r);
     string dir = buildDir(r);
     if(r.kv.count("install")){
-        return sh("bash -lc 'cd "+shellEscape(dir)+" && DESTDIR="+shellEscape(destdir)+" "+r.kv.at("install")+"' ");
+        return sh("bash -lc 'cd "+shellEscape(dir)+" && DESTDIR="+shellEscape(destroot)+" "+r.kv.at("install")+"' ");
     }
     if(bs=="autotools"){
-        return sh("bash -lc 'cd "+shellEscape(dir)+" && make DESTDIR="+shellEscape(destdir)+" install' ");
+        return sh("bash -lc 'cd "+shellEscape(dir)+" && make DESTDIR="+shellEscape(destroot)+" install' ");
     } else if(bs=="cmake"){
-        return sh("bash -lc 'cd "+shellEscape(dir)+" && cmake --install build --prefix /usr --config Release --verbose' ");
+        // cmake --install respeita CMAKE_INSTALL_PREFIX, DESTDIR via env, mas passamos via env
+        return sh("bash -lc 'cd "+shellEscape(dir)+" && DESTDIR="+shellEscape(destroot)+" cmake --install build --prefix /usr --config Release --verbose' ");
     } else if(bs=="meson"){
-        return sh("bash -lc 'cd "+shellEscape(dir)+" && meson install -C build' ");
+        return sh("bash -lc 'cd "+shellEscape(dir)+" && DESTDIR="+shellEscape(destroot)+" meson install -C build' ");
     }
     return 1;
 }
 
-// ========================= DB, Manifest & Logs =========================
-void dbRegister(const Recipe &r, const string& prefixUsed){
-    string d=dbDir(recipeName(r), recipeVersion(r)); ensureDir(d);
-    ofstream meta(joinPath(d, "meta"));
+// ========================= DB & Logs =========================
+void dbRegister(const Recipe &r, const vector<string>&deps){
+    string d=dbDir(r); ensureDir(d);
+    ofstream meta(metaPath(r));
     meta << "name="<<recipeName(r)<<"\n";
     meta << "version="<<recipeVersion(r)<<"\n";
     meta << "install_time="<<timestamp()<<"\n";
-    meta << "prefix="<<prefixUsed<<"\n";
-    // depende de:
     meta << "depends=";
-    for(size_t i=0;i<r.depends.size();++i){
-        auto &c=r.depends[i];
-        meta<<c.name<<c.op<<c.ver<<(i+1<r.depends.size()?" ":"");
-    }
-    meta<<"\n";
+    for(size_t i=0;i<deps.size();++i){ meta<<deps[i]<<(i+1<deps.size()?" ":""); }
+    meta << "\n";
 }
 
-struct InstalledMeta { string name, version, prefix; vector<Constraint> depends; };
-optional<InstalledMeta> readInstalled(const string& name, const string& ver){
-    string d = dbDir(name,ver); string m = joinPath(d,"meta");
-    ifstream in(m); if(!in) return {};
-    InstalledMeta im; string line;
-    while(getline(in,line)){
-        line=trim(line);
-        if(startsWith(line,"name=")) im.name=trim(line.substr(5));
-        else if(startsWith(line,"version=")) im.version=trim(line.substr(8));
-        else if(startsWith(line,"prefix=")) im.prefix=trim(line.substr(7));
-        else if(startsWith(line,"depends=")){
-            string deps=trim(line.substr(8)); stringstream ss(deps); string tok;
-            while(ss>>tok) im.depends.push_back(parseConstraint(tok));
-        }
-    }
-    if(im.name.empty()||im.version.empty()) return {};
-    return im;
+void dbUnregister(const string &name){
+    string d=joinPath(cfg.DB, name);
+    if(existsPath(d)) sh("rm -rf "+shellEscape(d));
 }
 
 string actionLog(const string &name,const string &action){ return joinPath(cfg.LOG, name+"-"+action+"-"+timestamp()+".log"); }
 
-int makePkgFromDest(const Recipe &r, const string &destdir){
-    string pkg = pkgTar(r);
-    string cmd = "bash -lc 'cd "+shellEscape(destdir)+" && tar -I zstd -cf "+shellEscape(pkg)+" .'";
-    return sh(cmd);
+map<string,set<string>> loadReverseDeps(){
+    map<string,set<string>> rd;
+    string f=reverseDepsPath();
+    ifstream in(f);
+    string a,b;
+    while(in>>a>>b){
+        rd[a].insert(b); // a <- b (b depende de a)
+    }
+    return rd;
 }
-int writeManifestFromDest(const Recipe &r, const string &destdir, const string& prefix){
-    string d = dbDir(recipeName(r), recipeVersion(r)); ensureDir(d);
+
+void saveReverseDeps(const map<string,set<string>>&rd){
+    string f=reverseDepsPath();
+    ofstream out(f);
+    for(auto &kv: rd){
+        for(auto &who: kv.second){
+            out<<kv.first<<" "<<who<<"\n";
+        }
+    }
+}
+
+void reverseDepsAdd(const string &dep, const string &who){
+    auto rd = loadReverseDeps();
+    rd[dep].insert(who);
+    saveReverseDeps(rd);
+}
+
+void reverseDepsRemove(const string &dep, const string &who){
+    auto rd = loadReverseDeps();
+    if(rd.count(dep)){ rd[dep].erase(who); if(rd[dep].empty()) rd.erase(dep); }
+    saveReverseDeps(rd);
+}
+
+set<string> reverseDepsOf(const string &pkg){
+    auto rd = loadReverseDeps();
+    if(rd.count(pkg)) return rd[pkg];
+    return {};
+}
+
+bool isInstalled(const string &name, string *versionOut=nullptr){
+    string d=joinPath(cfg.DB, name);
+    string meta=joinPath(d,"meta");
+    ifstream in(meta);
+    if(!in) return false;
+    string line; string ver;
+    while(getline(in,line)){
+        if(line.rfind("version=",0)==0){ ver=trim(line.substr(8)); break; }
+    }
+    if(versionOut) *versionOut = ver;
+    return true;
+}
+
+// ========================= Empacotamento & Manifesto =========================
+int writeManifestFromDest(const Recipe &r, const string &destroot){
+    string d = dbDir(r); ensureDir(d);
     // Arquivos
     {
-        ofstream mf(manifestFilesPath(recipeName(r),recipeVersion(r))); if(!mf) return 1;
-        string cmd = "bash -lc 'cd "+shellEscape(destdir)+" && find . -type f -o -type l | sed \"s#^\\./##\" | sort'";
+        ofstream mf(manifestFilesPath(r)); if(!mf) return 1;
+        string cmd = "bash -lc 'cd "+shellEscape(destroot)+" && find . -type f -o -type l | sed \"s#^\\./##\" | sort'";
         FILE* pipe=popen(cmd.c_str(), "r"); if(!pipe) return 1; char buf[4096];
         while(fgets(buf,sizeof(buf),pipe)){
             string rel=string(buf); rel.erase(remove(rel.begin(), rel.end(),'\n'), rel.end()); if(rel.empty()) continue; 
-            mf << joinPath(prefix, rel) << "\n"; 
+            mf << joinPath(cfg.DESTROOT, rel) << "\n"; 
         }
         pclose(pipe);
     }
-    // Diretórios (para remoção posterior, do mais profundo ao mais raso)
+    // Diretórios
     {
-        ofstream md(manifestDirsPath(recipeName(r),recipeVersion(r))); if(!md) return 1;
-        string cmd = "bash -lc 'cd "+shellEscape(destdir)+" && find . -type d | sed \"s#^\\./##\" | sort -r'";
+        ofstream md(manifestDirsPath(r)); if(!md) return 1;
+        string cmd = "bash -lc 'cd "+shellEscape(destroot)+" && find . -type d | sed \"s#^\\./##\" | sort -r'";
         FILE* pipe=popen(cmd.c_str(), "r"); if(!pipe) return 1; char buf[4096];
         vector<string> dirs;
         while(fgets(buf,sizeof(buf),pipe)){
             string rel=string(buf); rel.erase(remove(rel.begin(), rel.end(),'\n'), rel.end()); if(rel==".") continue; 
-            dirs.push_back(joinPath(prefix, rel));
+            dirs.push_back(joinPath(cfg.DESTROOT, rel));
         }
         pclose(pipe);
         for(auto &d: dirs) md<<d<<"\n";
@@ -595,584 +459,603 @@ int writeManifestFromDest(const Recipe &r, const string &destdir, const string& 
     return 0;
 }
 
-int installPkgToRoot(const Recipe &r, const string &pkg, const string& prefix){
-    return sh("tar -I zstd -xf "+shellEscape(pkg)+" -C "+shellEscape(prefix));
+string buildRootFor(const Recipe &r){
+    return joinPath(cfg.BUILDROOT, recipeName(r)+"-"+recipeVersion(r));
 }
 
-// ========================= Repositórios & Sync =========================
-string repoFolderName(const string& url){
-    // nome estável por hash simples
-    return "repo-" + to_string(hash<string>{}(url));
-}
-int syncOneRepo(const string& url){
-    string localDir = joinPath(cfg.REPOS_ROOT, repoFolderName(url));
-    if(startsWith(url,"git+")){
-        string gitUrl = stripGitPrefix(url);
-        if(existsPath(joinPath(localDir,".git"))){
-            return sh("git -C "+shellEscape(localDir)+" pull --ff-only");
-        } else {
-            ensureDir(localDir);
-            return sh("bash -lc 'rm -rf "+shellEscape(localDir)+" && git clone --depth 1 "+shellEscape(gitUrl)+" "+shellEscape(localDir)+"'");
-        }
-    } else if(startsWith(url,"http://")||startsWith(url,"https://")){
-        ensureDir(localDir);
-        string tarball = joinPath(cfg.CACHE, "repo-"+to_string(hash<string>{}(url))+".tar");
-        if(fetchHttp(url, tarball)!=0) return 1;
-        // limpar e extrair
-        sh("rm -rf "+shellEscape(localDir));
-        ensureDir(localDir);
-        int rc = extractArchive(tarball, localDir);
-        return rc;
-    } else {
-        // caminho local
-        if(existsPath(url) && fs::is_directory(url)){
-            sh("rm -rf "+shellEscape(localDir));
-            return sh("bash -lc 'cp -a "+shellEscape(url)+"/. "+shellEscape(localDir)+"/'");
-        }
-        cerr<<C(ansi::red)<<"URL de repositório desconhecida: "<<url<<C(ansi::reset)<<"\n";
-        return 2;
+int makeBinaryPackage(const Recipe &r, const string &destroot, string &outPkgPath){
+    // cria tar do conteúdo de destroot com meta + sha256
+    string arch = shOut1("uname -m");
+    string base = recipeName(r)+"-"+recipeVersion(r)+"-"+arch+".fbuildpkg";
+    string pkg = joinPath(joinPath(cfg.PKGROOT,"bin"), base);
+
+    // preparar staging temp (para incluir meta)
+    string staging = joinPath(cfg.WORK, string("stage-")+recipeName(r)+"-"+recipeVersion(r));
+    if(existsPath(staging)) sh("rm -rf "+shellEscape(staging));
+    ensureDir(staging);
+
+    // copiar a raiz (conteúdo) para staging/root/
+    ensureDir(joinPath(staging,"root"));
+    // Usamos tar pipeline para preservar links/perms; se houver fakeroot, não precisamos copiar, mas para embutir meta fica simples copiar.
+    // Usar rsync seria melhor, mas manteremos tar | tar:
+    string copyCmd = "bash -lc 'cd "+shellEscape(destroot)+" && tar -cf - . | (cd "+shellEscape(joinPath(staging,"root"))+" && tar -xf -)'";
+    if(sh(copyCmd)!=0) return 1;
+
+    // meta simples (key=value)
+    string metaFile = joinPath(staging,"meta");
+    {
+        ofstream m(metaFile);
+        m << "name="<<recipeName(r)<<"\n";
+        m << "version="<<recipeVersion(r)<<"\n";
+        m << "arch="<<arch<<"\n";
+        // dependências (usar r.depends)
+        m << "depends=";
+        for(size_t i=0;i<r.depends.size();++i) m<<r.depends[i]<<(i+1<r.depends.size()?" ":"");
+        m << "\n";
+        m << "built_at="<<timestamp()<<"\n";
+        m << "build_system="<<recipeBuildSys(r)<<"\n";
     }
+
+    // criar pacote .fbuildpkg (tar -I zstd/gzip)
+    string comp = (global_binfmt=="gz")? "gzip -c" : "zstd -19 -T0";
+    string suffix = (global_binfmt=="gz")? ".tar.gz" : ".tar.zst";
+    // Para manter extensão .fbuildpkg, mas compactar com comp adequado
+    // Vamos criar tar sem extensão e depois mover.
+    string tmpTar = joinPath(cfg.WORK, string("binpkg-")+to_string(rand())+".tar");
+    string tarCmd  = "bash -lc 'cd "+shellEscape(staging)+" && tar -cf "+shellEscape(tmpTar)+" .'";
+    if(sh(tarCmd)!=0) return 1;
+
+    string outTmp = tmpTar + (global_binfmt=="gz"?".gz":".zst");
+    string compCmd = "bash -lc '"+comp+" < "+shellEscape(tmpTar)+" > "+shellEscape(outTmp)+"'";
+    if(haveCmd("fakeroot")){
+        // compressão não precisa fakeroot; conteúdo já possui perms do destroot. Se quisesse simular dono root:root na criação do tar,
+        // teríamos que gerar tar dentro de fakeroot. Para simplicidade, aceitamos assim.
+        // (opcional) poderíamos refazer empacotamento com: fakeroot sh -lc 'cd staging && tar ...'
+    }
+    if(sh(compCmd)!=0) return 1;
+
+    // Calcular sha256 do pacote comprimido e armazenar em arquivo .sha256 (ao lado do .fbuildpkg)
+    string hash = sha256OfFile(outTmp);
+
+    // mover/renomear para .fbuildpkg
+    if(existsPath(pkg)) sh("rm -f "+shellEscape(pkg));
+    if(sh("mv "+shellEscape(outTmp)+" "+shellEscape(pkg))!=0) return 1;
+
+    string shaFile = pkg + ".sha256";
+    ofstream s(shaFile); s<<hash<<"\n";
+
+    // limpeza staging e tmpTar
+    sh("rm -f "+shellEscape(tmpTar));
+    sh("rm -rf "+shellEscape(staging));
+
+    outPkgPath = pkg;
+    return 0;
 }
+
+int installPkgToRootFS(const Recipe &r, const string &pkg){
+    // Verificar SHA do pacote se existir .sha256 junto
+    string shaFile = pkg + ".sha256";
+    if(existsPath(shaFile)){
+        ifstream in(shaFile); string expect; getline(in,expect); expect=trim(expect);
+        if(!verifySha256File(pkg, expect)){ cerr<<C(ansi::red)<<"SHA256 do pacote binário divergente"<<C(ansi::reset)<<"\n"; return 1; }
+    }
+    // Extrair no root real (cfg.DESTROOT)
+    string cmd = "bash -lc 'tar -I "+string(global_binfmt=="gz"?"gzip":"zstd")+" -xf "+shellEscape(pkg)+" -C "+shellEscape(cfg.DESTROOT)+"'";
+    // O pacote contém: ./root/... e ./meta; precisamos extrair **apenas root** no destino final.
+    // Para manter simples: extraímos tudo num tmp, depois movemos root/* para DESTROOT/
+    string tmp = joinPath(cfg.WORK, string("installpkg-")+recipeName(r)+"-"+recipeVersion(r));
+    if(existsPath(tmp)) sh("rm -rf "+shellEscape(tmp));
+    ensureDir(tmp);
+
+    string extractCmd = "bash -lc 'tar -I "+string(global_binfmt=="gz"?"gzip":"zstd")+" -xf "+shellEscape(pkg)+" -C "+shellEscape(tmp)+"'";
+    if(sh(extractCmd)!=0) return 1;
+
+    // mover root/* para DESTROOT/
+    string moveCmd = "bash -lc 'cd "+shellEscape(joinPath(tmp,"root"))+" && tar -cf - . | (cd "+shellEscape(cfg.DESTROOT)+" && tar -xf -)'";
+    if(sh(moveCmd)!=0) return 1;
+
+    // limpeza
+    sh("rm -rf "+shellEscape(tmp));
+    return 0;
+}
+
+// ========================= Busca/Receitas =========================
+vector<string> findRecipesFiles(const string &query="", bool onlyExact=false){
+    vector<string> found; 
+    for(const string &cat: {"base","x11","extras","desktop"}){
+        string cdir = joinPath(cfg.REPO, cat);
+        string cmd = "bash -lc 'shopt -s globstar nullglob; for f in " + shellEscape(cdir) + "/**/*.fbuild; do echo \"$f\"; done'";
+        FILE* pipe=popen(cmd.c_str(), "r"); if(!pipe) continue; char buf[4096];
+        while(fgets(buf,sizeof(buf),pipe)){
+            string p=trim(buf); if(p.empty()) continue; 
+            if(query.empty()){
+                found.push_back(p);
+            } else {
+                string base=fs::path(p).filename().string();
+                if(onlyExact){
+                    if(base==query || base.find(query)!=string::npos) found.push_back(p);
+                }else{
+                    if(base.find(query)!=string::npos) found.push_back(p);
+                }
+            }
+        }
+        pclose(pipe);
+    }
+    sort(found.begin(), found.end());
+    return found;
+}
+
+string findRecipeByNamePreferExact(const string &name){
+    // procura por arquivo .../<name>-<ver>.fbuild preferindo match prefixo
+    auto all = findRecipesFiles(name);
+    for(auto &p: all){
+        string fname = fs::path(p).filename().string();
+        if(fname.rfind(name,0)==0 && fname.find(".fbuild")!=string::npos) return p;
+    }
+    // fallback 1o
+    if(!all.empty()) return all[0];
+    return "";
+}
+
+// ========================= Resolução de dependências =========================
+struct Node {
+    string name;
+    string file;
+    vector<string> deps;
+};
+
+map<string,Node> loadAllNodesForTargets(const vector<string>&targets){
+    map<string,Node> nodes;
+    // carregar recipe de cada alvo e seus deps
+    deque<string> q(targets.begin(), targets.end());
+    set<string> visited;
+    while(!q.empty()){
+        string t = q.front(); q.pop_front();
+        if(visited.count(t)) continue; visited.insert(t);
+        string rf = findRecipeByNamePreferExact(t);
+        if(rf.empty()){ cerr<<C(ansi::red)<<"Receita não encontrada para "<<t<<C(ansi::reset)<<"\n"; exit(1); }
+        Recipe r = loadRecipe(rf);
+        Node n; n.name = recipeName(r); n.file = rf; n.deps = r.depends;
+        nodes[n.name]=n;
+        for(auto &d: r.depends) q.push_back(d);
+    }
+    return nodes;
+}
+
+vector<string> topoSort(const map<string,Node>&graph){
+    // Kahn
+    map<string,int> indeg;
+    for(auto &kv: graph){ indeg[kv.first]=0; }
+    for(auto &kv: graph){
+        for(auto &d: kv.second.deps){
+            if(indeg.count(d)==0) indeg[d]=0;
+            indeg[kv.first]++;
+        }
+    }
+    deque<string> q;
+    for(auto &kv: indeg) if(kv.second==0) q.push_back(kv.first);
+    vector<string> order;
+    while(!q.empty()){
+        string u=q.front(); q.pop_front();
+        order.push_back(u);
+        for(auto &kv: graph){
+            if(find(kv.second.deps.begin(), kv.second.deps.end(), u)!=kv.second.deps.end()){
+                if(--indeg[kv.first]==0) q.push_back(kv.first);
+            }
+        }
+    }
+    if(order.size()!=graph.size()){
+        cerr<<C(ansi::red)<<"Ciclo de dependência detectado!"<<C(ansi::reset)<<"\n";
+        exit(1);
+    }
+    return order;
+}
+
+// ========================= Ações =========================
 int action_sync(const vector<string>&){
-    if(cfg.REPO_URLS.empty()){
-        cerr<<C(ansi::yellow)<<"Nenhum repositório configurado. Edite "<<cfg.CONF<<" e adicione 'repos=...'\n"<<C(ansi::reset);
+    if(!existsPath(joinPath(cfg.REPO, ".git"))){
+        cerr<<C(ansi::yellow)<<"Aviso: REPO não é um repositório git. Pulando."<<C(ansi::reset)<<"\n";
         return 0;
     }
-    Spinner sp; sp.start("Sincronizando repositórios");
-    int rc=0;
-    for(auto& u: cfg.REPO_URLS){
-        int r = syncOneRepo(u);
-        if(r!=0) rc=r;
-    }
+    Spinner sp; sp.start("Sincronizando repositório");
+    int rc = sh("git -C "+shellEscape(cfg.REPO)+" pull --ff-only");
     if(rc==0) sp.stopOk(); else sp.stopFail();
     return rc;
 }
 
-// ========================= Busca Recipes & Info =========================
-vector<string> findRecipesByName(const RecipeIndex& idx, const string &query){
-    vector<string> found; 
-    for(auto &kv: idx.entries){
-        if(query.empty() || kv.first.find(query)!=string::npos){
-            for(auto &e: kv.second) found.push_back(e.file);
-        }
-    }
-    return found;
-}
-int action_search(const vector<string>&args){
-    string q = args.size()? args[0]: string("");
-    auto idx = buildRecipeIndex();
-    auto res = findRecipesByName(idx, q);
-    for(auto &p: res) cout<<p<<"\n";
+int action_new(const vector<string>&args){
+    if(args.size()<2){ cerr<<"Uso: fbuild new <categoria> <nome> <versão>\n"; return 1; }
+    string cat=args[0]; string name=args[1]; string ver=args.size()>=3?args[2]:"1.0";
+    string dir = joinPath(joinPath(cfg.REPO, cat), name+"-"+ver);
+    ensureDir(dir);
+    string file = joinPath(dir, name+"-"+ver+".fbuild");
+    ofstream f(file);
+    f << "# Exemplo de receita fbuild\n";
+    f << "name="<<name<<"\nversion="<<ver<<"\nsummary=\nlicense=\nhomepage=\n";
+    f << "source0=\n# sha2560=\n# patch0=\n";
+    f << "build_system=autotools\n# build_opts=\n# pre_build=\n# build=\n# install=\n# build_dir=.\n# depends=\n";
+    cout<<file<<" criado.\n";
     return 0;
 }
+
+int action_search(const vector<string>&args){ string q = args.size()? args[0]: string(""); for(auto &p: findRecipesFiles(q)) cout<<p<<"\n"; return 0; }
+
 int action_info(const vector<string>&args){
     if(args.empty()){ cerr<<"Uso: fbuild info <arquivo .fbuild>\n"; return 1; }
-    Recipe r=loadRecipeFile(args[0]);
+    Recipe r=loadRecipe(args[0]);
     cout<<C(ansi::bold)<<recipeName(r)<<" "<<recipeVersion(r)<<C(ansi::reset)<<"\n";
     for(auto &kv: r.kv) cout<<kv.first<<"="<<kv.second<<"\n";
     for(size_t i=0;i<r.sources.size();++i) cout<<"source"<<i<<"="<<r.sources[i]<<"\n";
     for(size_t i=0;i<r.patches.size();++i) cout<<"patch"<<i<<"="<<r.patches[i]<<"\n";
     for(size_t i=0;i<r.sha256.size();++i) cout<<"sha256"<<i<<"="<<r.sha256[i]<<"\n";
-    cout<<"depends="; for(size_t i=0;i<r.depends.size();++i){ auto& c=r.depends[i]; cout<<c.name<<c.op<<c.ver<<(i+1<r.depends.size()?" ":""); } cout<<"\n";
+    for(size_t i=0;i<r.depends.size();++i) cout<<"depends+"<<i<<"="<<r.depends[i]<<"\n";
     return 0;
 }
 
-// ========================= Resolução de dependências =========================
-struct Node { string name, version, file; vector<Constraint> deps; };
-struct Graph {
-    map<string, Node> nodes; // chave: name@version
-    map<string, vector<string>> edges; // key -> lista de keys dependidas
-};
+int do_build_only(const Recipe &r){
+    requireCmds({"bash","git","curl","tar","patch"});
+    runHook("pre-download", r);
+    string out; if(downloadSources(r,out)!=0) { cerr<<"download falhou\n"; return 1; }
+    runHook("post-download", r);
 
-string keyOf(const string& n, const string& v){ return n+"@"+v; }
+    runHook("pre-patch", r);
+    if(applyPatches(r)!=0) { cerr<<"patch falhou\n"; return 1; }
+    runHook("post-patch", r);
 
-Node loadNodeFromEntry(const RecipeIndexEntry& e){
-    Recipe r = loadRecipeFile(e.file);
-    Node n; n.name=recipeName(r); n.version=recipeVersion(r); n.file=e.file; n.deps=r.depends;
-    return n;
+    runHook("pre-build", r);
+    if(runBuildSystem(r)!=0) { cerr<<"build falhou\n"; return 1; }
+    runHook("post-build", r);
+
+    return 0;
 }
 
-optional<Node> chooseNodeFor(const RecipeIndex& idx, const Constraint& want){
-    auto ent = selectRecipe(idx, want);
-    if(!ent) return {};
-    return loadNodeFromEntry(*ent);
+int action_build(const vector<string>&args){
+    if(args.empty()){ cerr<<"Uso: fbuild build <.fbuild>\n"; return 1; }
+    Recipe r=loadRecipe(args[0]);
+    return do_build_only(r);
 }
 
-Graph resolveDeps(const RecipeIndex& idx, const Constraint& root, const set<string>& alreadyInstalled){
-    // BFS/DFS selecionando melhor versão para cada constraint e verificando conflitos básicos
-    Graph g;
-    map<string,string> chosen; // name -> version
-    function<void(const Constraint&)> add = [&](const Constraint& c){
-        // se já instalado com uma versão que satisfaz, pode pular (otimização)
-        for(const auto& k : alreadyInstalled){
-            auto p = k.find('@');
-            if(p!=string::npos){
-                string n=k.substr(0,p), v=k.substr(p+1);
-                if(n==c.name && versionSatisfies(v,c)){ 
-                    chosen[n]=v;
-                    string kk=keyOf(n,v);
-                    if(!g.nodes.count(kk)){
-                        // criar nó virtual instalado (sem deps conhecidos — ok)
-                        Node nnode; nnode.name=n; nnode.version=v; nnode.file=""; 
-                        g.nodes[kk]=nnode;
-                    }
-                    return;
-                }
-            }
-        }
-        // escolher recipe
-        auto node = chooseNodeFor(idx, c);
-        if(!node){
-            cerr<<C(ansi::red)<<"Dependência não encontrada: "<<c.name;
-            if(!c.op.empty()) cerr<<" ("<<c.op<<c.ver<<")";
-            cerr<<C(ansi::reset)<<"\n";
-            exit(3);
-        }
-        string prev = chosen[c.name];
-        if(prev.empty() || cmpVersion(node->version, prev)>0){
-            chosen[c.name]=node->version;
-        }
-        string key = keyOf(node->name, node->version);
-        if(!g.nodes.count(key)) g.nodes[key]=*node;
-        // adicionar arestas para deps (serão preenchidas depois)
-    };
-    add(root);
+// Instala a partir do binário (se existir). Se não, compila, empacota e instala.
+int install_with_binary_or_source(Recipe r, const vector<string>&depChain){
+    requireCmds({"bash","git","curl","tar","patch","sha256sum"});
+    if(global_binfmt=="zst") requireCmds({"zstd"});
+    else requireCmds({"gzip"});
 
-    // Expande recursivamente
-    bool changed=true;
-    while(changed){
-        changed=false;
-        vector<pair<string,string>> snapshot;
-        for(auto& kv: g.nodes) snapshot.push_back({kv.second.name, kv.second.version});
-        for(auto& nv: snapshot){
-            string key = keyOf(nv.first, nv.second);
-            Node& nd = g.nodes[key];
-            for(const auto& depc: nd.deps){
-                string reqName = depc.name;
-                if(reqName.empty()) continue;
-                string wantOp=depc.op, wantVer=depc.ver;
-                // Se já temos uma versão escolhida, checar constraint; senão, escolher
-                Constraint c = depc;
-                if(chosen.count(reqName)){
-                    string has = chosen[reqName];
-                    if(!versionSatisfies(has, c)){
-                        // tentar escolher outra maior que satisfaça
-                        auto ent = selectRecipe(idx, c);
-                        if(!ent){
-                            cerr<<C(ansi::red)<<"Conflito de versões para "<<reqName<<" (já selecionado "<<has<<", requer "<<c.op<<c.ver<<")"<<C(ansi::reset)<<"\n";
-                            exit(4);
-                        }
-                        if(cmpVersion(ent->version, has)>0){
-                            chosen[reqName]=ent->version;
-                            // adicionar/atualizar nó
-                            auto node = loadNodeFromEntry(*ent);
-                            string k2 = keyOf(node.name, node.version);
-                            g.nodes[k2]=node;
-                            changed=true;
-                        }
-                    }
-                } else {
-                    add(c); changed=true;
-                }
-                // registrar aresta: nd -> reqName@chosen[reqName]
-                string ver = chosen[reqName];
-                if(!ver.empty()){
-                    string depKey = keyOf(reqName, ver);
-                    g.edges[key].push_back(depKey);
-                }
-            }
+    string log = actionLog(recipeName(r), "install");
+
+    // Tenta binário primeiro
+    string binpkg = pkgTarPath(r);
+    if(existsPath(binpkg)){
+        Spinner sp; sp.start("Instalando binário "+fs::path(binpkg).filename().string());
+        if(installPkgToRootFS(r, binpkg)!=0){ sp.stopFail(); cerr<<"instalação do binário falhou; tentando compilar do source\n"; }
+        else {
+            sp.stopOk();
+            // registrar DB e manifest a partir do pacote já instalado
+            // Para capturar o manifesto, não temos destroot; então não sabemos lista de arquivos. Opcionalmente, podemos montar um destroot temporário:
+            // Estratégia: não refazer manifesto aqui (seria caro). Em vez disso, construir um "manifest" aproximando do pacote (não temos índice). 
+            // Solução prática: durante empacotar, já salvamos manfestos no DB? Preferimos gerar manifesto quando empacotamos.
+            // Como pode ter sido feito por outra máquina, aqui geramos manifesto através de "pkg verify": NÃO temos. Então aceitamos sem manifesto (limitação).
+            // Para resolver: após instalar, rodar "find" para capturar alterações é arriscado. Manteremos aviso:
+            cerr<<C(ansi::yellow)<<"Aviso: pacote binário instalado sem manifesto local. Recomenda-se instalar uma vez via fonte nesta máquina para manifestos precisos.\n"<<C(ansi::reset);
+            dbRegister(r, r.depends);
+            for(auto &d: r.depends) reverseDepsAdd(d, recipeName(r));
+            cout<<C(ansi::green)<<"Instalado (binário): "<<recipeName(r)<<"-"<<recipeVersion(r)<<C(ansi::reset)<<"\n";
+            return 0;
         }
     }
 
-    // detecção de ciclos e ordenação topológica rudimentar (apenas para checagem)
-    enum Mark{N=0,VISITING,DONE};
-    map<string,Mark> mark;
-    function<void(const string&)> dfs=[&](const string& k){
-        if(mark[k]==VISITING){ cerr<<C(ansi::red)<<"Ciclo de dependência detectado envolvendo "<<k<<C(ansi::reset)<<"\n"; exit(5); }
-        if(mark[k]==DONE) return;
-        mark[k]=VISITING;
-        for(auto& to : g.edges[k]) dfs(to);
-        mark[k]=DONE;
-    };
-    for(auto& kv: g.nodes) dfs(kv.first);
-    return g;
-}
-vector<string> topoOrder(const Graph& g){
-    // Kahn
-    map<string,int> indeg;
-    for(auto& kv: g.nodes) indeg[kv.first]=0;
-    for(auto& kv: g.edges) for(auto& to: kv.second) indeg[to]++;
-    queue<string> q;
-    for(auto& kv: indeg) if(kv.second==0) q.push(kv.first);
-    vector<string> out;
-    while(!q.empty()){
-        auto u=q.front(); q.pop(); out.push_back(u);
-        if(g.edges.count(u)) for(auto& v: g.edges.at(u)){ if(--indeg[v]==0) q.push(v); }
-    }
-    if(out.size()!=g.nodes.size()){
-        cerr<<C(ansi::red)<<"Falha na ordenação topológica (grafo inconsistente)."<<C(ansi::reset)<<"\n"; exit(6);
-    }
-    return out;
-}
-
-// ========================= Ações principais =========================
-int action_download(const vector<string>&args){
-    if(args.empty()){ cerr<<"Uso: fbuild download <.fbuild>\n"; return 1; }
-    Recipe r=loadRecipeFile(args[0]);
-    runHook("pre-download", r); 
-    Spinner sp; sp.start("Baixando fontes");
-    int rc=downloadSources(r);
-    if(rc==0) sp.stopOk(); else sp.stopFail();
-    runHook("post-download", r); 
-    return rc;
-}
-int action_unpack(const vector<string>&args){
-    if(args.empty()){ cerr<<"Uso: fbuild unpack <.fbuild>\n"; return 1; }
-    Recipe r=loadRecipeFile(args[0]);
-    runHook("pre-download", r); string out; if(downloadSources(r)!=0) return 1; runHook("post-download", r);
-    runHook("pre-patch", r); 
-    Spinner sp; sp.start("Aplicando patches");
-    int rc=applyPatches(r);
-    if(rc==0) sp.stopOk(); else sp.stopFail();
-    runHook("post-patch", r); 
-    return rc;
-}
-int action_patch(const vector<string>&args){
-    if(args.empty()){ cerr<<"Uso: fbuild patch <.fbuild>\n"; return 1; }
-    Recipe r=loadRecipeFile(args[0]);
-    runHook("pre-patch", r); 
-    Spinner sp; sp.start("Aplicando patches");
-    int rc=applyPatches(r);
-    if(rc==0) sp.stopOk(); else sp.stopFail();
-    runHook("post-patch", r); 
-    return rc;
-}
-
-int buildAndMaybeInstall(const Recipe& r, bool doInstall, const string& altPrefix, int jobs, bool force){
-    requireCmds({"bash","git","curl","tar","patch","sha256sum","zstd"});
-    // download+patch
-    runHook("pre-download", r); if(downloadSources(r)!=0) { cerr<<"download falhou\n"; return 1; } runHook("post-download", r);
+    // Caminho por fonte: baixar, patch, build, DESTDIR, empacotar, instalar
+    runHook("pre-download", r); string out; if(downloadSources(r,out)!=0) { cerr<<"download falhou\n"; return 1; } runHook("post-download", r);
     runHook("pre-patch", r); if(applyPatches(r)!=0) { cerr<<"patch falhou\n"; return 1; } runHook("post-patch", r);
-    // build
-    runHook("pre-build", r); if(runBuildSystem(r, jobs)!=0) { cerr<<"build falhou\n"; return 1; } runHook("post-build", r);
+    runHook("pre-build", r); if(runBuildSystem(r)!=0) { cerr<<"build falhou\n"; return 1; } runHook("post-build", r);
 
-    if(!doInstall) return 0;
-
-    string tmpdest = joinPath(cfg.WORK, string("dest-")+recipeName(r)+"-"+recipeVersion(r));
-    if(existsPath(tmpdest)) sh("rm -rf "+shellEscape(tmpdest)); ensureDir(tmpdest);
+    // DESTDIR isolado
+    string destroot = buildRootFor(r);
+    if(existsPath(destroot)) sh("rm -rf "+shellEscape(destroot));
+    ensureDir(destroot);
 
     runHook("pre-install", r);
-    if(runInstall(r, tmpdest)!=0) { cerr<<"install (fase em DESTDIR) falhou\n"; sh("rm -rf "+shellEscape(tmpdest)); return 1; }
+    if(runInstallDestdir(r, destroot)!=0) { cerr<<"install (em DESTDIR) falhou\n"; sh("rm -rf "+shellEscape(destroot)); return 1; }
 
-    // prefix: padrão é cfg.DESTDIR, mas se altPrefix setado, instala lá
-    string prefixUsed = altPrefix.empty()? cfg.DESTDIR: altPrefix;
+    // Manifesto
+    if(writeManifestFromDest(r, destroot)!=0) cerr<<C(ansi::yellow)<<"Aviso: não foi possível gerar manifesto"<<C(ansi::reset)<<"\n";
 
-    if(writeManifestFromDest(r, tmpdest, prefixUsed)!=0) cerr<<C(ansi::yellow)<<"Aviso: não foi possível gerar manifesto"<<C(ansi::reset)<<"\n";
-    if(makePkgFromDest(r, tmpdest)!=0) { cerr<<"empacotamento falhou\n"; return 1; }
-    if(installPkgToRoot(r, pkgTar(r), prefixUsed)!=0) { cerr<<"instalação no root falhou\n"; return 1; }
+    // Empacotar
+    string outpkg;
+    if(makeBinaryPackage(r, destroot, outpkg)!=0) { cerr<<"empacotamento falhou\n"; return 1; }
+
+    // Instalar o binário recém-criado
+    if(installPkgToRootFS(r, outpkg)!=0) { cerr<<"instalação do pacote binário falhou\n"; return 1; }
     runHook("post-install", r);
 
-    dbRegister(r, prefixUsed);
-    cout<<C(ansi::green)<<"Instalado: "<<recipeName(r)<<"-"<<recipeVersion(r)<<" (prefix="<<prefixUsed<<")"<<C(ansi::reset)<<"\n";
+    dbRegister(r, r.depends);
+    for(auto &d: r.depends) reverseDepsAdd(d, recipeName(r));
+    cout<<C(ansi::green)<<"Instalado: "<<recipeName(r)<<"-"<<recipeVersion(r)<<C(ansi::reset)<<"\n";
+
     // limpeza
-    sh("rm -rf "+shellEscape(tmpdest));
+    sh("rm -rf "+shellEscape(destroot));
     return 0;
 }
 
-int action_build(const vector<string>&args, const map<string,string>& opts){
-    if(args.empty()){ cerr<<"Uso: fbuild build <.fbuild> [--alt-prefix /opt/... ] [--jobs N]\n"; return 1; }
-    Recipe r=loadRecipeFile(args[0]);
-    string alt=opts.count("alt-prefix")? opts.at("alt-prefix"): "";
-    int jobs = opts.count("jobs")? stoi(opts.at("jobs")): (cfg.JOBS>0? cfg.JOBS: 0);
-    return buildAndMaybeInstall(r, false, alt, jobs, false);
-}
-int action_install(const vector<string>&args, const map<string,string>& opts){
-    if(args.empty()){ cerr<<"Uso: fbuild install <.fbuild> [--alt-prefix /opt/... ] [--jobs N] [--force]\n"; return 1; }
-    Recipe r=loadRecipeFile(args[0]);
-    string alt=opts.count("alt-prefix")? opts.at("alt-prefix"): "";
-    int jobs = opts.count("jobs")? stoi(opts.at("jobs")): (cfg.JOBS>0? cfg.JOBS: 0);
-    bool force = opts.count("force");
-    return buildAndMaybeInstall(r, true, alt, jobs, force);
-}
+int action_install(const vector<string>&args){
+    if(args.empty()){ cerr<<"Uso: fbuild install <arquivo.fbuild|nome>\n"; return 1; }
 
-// ========================= Remove / Orphans / Upgrade =========================
-vector<pair<string,string>> listInstalled(){
-    vector<pair<string,string>> v;
-    if(!existsPath(cfg.DB)) return v;
-    for(auto& d: fs::directory_iterator(cfg.DB)){
-        if(!d.is_directory()) continue;
-        string k=d.path().filename().string();
-        auto p=k.find('@'); if(p==string::npos) continue;
-        v.push_back({k.substr(0,p), k.substr(p+1)});
+    // Se arg parece arquivo, usa direto; senão, resolve recipe
+    string path = args[0];
+    Recipe r;
+    if(fs::exists(path)) r = loadRecipe(path);
+    else {
+        string rf = findRecipeByNamePreferExact(path);
+        if(rf.empty()){ cerr<<C(ansi::red)<<"Receita não encontrada: "<<path<<C(ansi::reset)<<"\n"; return 1; }
+        r = loadRecipe(rf);
     }
-    sort(v.begin(), v.end());
-    return v;
-}
 
-set<string> installedKeys(){
-    set<string> s;
-    for(auto& pr: listInstalled()) s.insert(keyOf(pr.first, pr.second));
-    return s;
-}
+    // Resolver dependências (topo) e instalar na ordem
+    auto nodes = loadAllNodesForTargets({recipeName(r)});
+    auto order = topoSort(nodes);
 
-bool hasDependents(const string& name, const string& ver){
-    // lê todos instalados e checa se alguém depende desse exatamente (por nome e constraint que satisfaça ver)
-    auto all=listInstalled();
-    for(auto& pr: all){
-        auto meta = readInstalled(pr.first, pr.second);
-        if(!meta) continue;
-        for(auto& c: meta->depends){
-            if(c.name==name && versionSatisfies(ver,c)) return true;
-        }
-    }
-    return false;
-}
-
-int action_remove(const vector<string>&args, const map<string,string>& opts){
-    if(args.empty()){ cerr<<"Uso: fbuild remove <nome> [--version X.Y.Z] [--force]\n"; return 1; }
-    string name=args[0];
-    string ver = opts.count("version")? opts.at("version"): "";
-    bool force= opts.count("force");
-
-    // se versão não informada e houver múltiplas, pedir especificar (aqui: remove todas se não especificar)
-    vector<pair<string,string>> inst = listInstalled();
-    vector<string> targets;
-    for(auto& pr: inst) if(pr.first==name && (ver.empty() || pr.second==ver)) targets.push_back(pr.second);
-    if(targets.empty()){ cerr<<C(ansi::yellow)<<"Pacote não instalado: "<<name<<(ver.empty()?"":("@"+ver))<<C(ansi::reset)<<"\n"; return 0; }
-
-    for(auto& v: targets){
-        if(!force && hasDependents(name,v)){
-            cerr<<C(ansi::red)<<"Não é seguro remover "<<name<<"@"<<v<<": há pacotes que dependem dele. Use --force para forçar.\n"<<C(ansi::reset);
+    // Instalar deps primeiro (exceto o alvo se aparecer no meio)
+    for(const string &pkg : order){
+        string rf = nodes[pkg].file;
+        Recipe rr = loadRecipe(rf);
+        if(pkg==recipeName(r)) continue; // deixa alvo por último
+        string installedVer;
+        if(isInstalled(pkg, &installedVer)){
+            // já instalado; pula (futuro: comparar versão)
             continue;
         }
-        // carregar meta para hooks
-        Recipe dummy; dummy.kv["name"]=name; dummy.kv["version"]=v;
-
-        // hooks
-        runHook("pre-remove", dummy);
-
-        string d=joinPath(cfg.DB, name+"@"+v);
-        string mfpath = joinPath(d,"manifest.files");
-        string mdpath = joinPath(d,"manifest.dirs");
-        // Remover arquivos
-        ifstream mf(mfpath);
-        if(mf){
-            vector<string> files; string path;
-            while(getline(mf,path)){ path=trim(path); if(!path.empty()) files.push_back(path); }
-            for(auto it=files.rbegin(); it!=files.rend(); ++it){
-                string cmd = "bash -lc 'if [ -e " + shellEscape(*it) + " ] || [ -L " + shellEscape(*it) + " ]; then rm -f " + shellEscape(*it) + "; fi'";
-                sh(cmd);
-            }
-        } else {
-            cerr<<C(ansi::yellow)<<"Aviso: manifest.files ausente; não é possível remover arquivos"<<C(ansi::reset)<<"\n";
-        }
-        // Remover diretórios listados (vazios)
-        ifstream md(mdpath);
-        if(md){
-            vector<string> dirs; string path; while(getline(md,path)){ path=trim(path); if(!path.empty()) dirs.push_back(path); }
-            for(auto &dir: dirs){ string cmd = "bash -lc 'if [ -d " + shellEscape(dir) + " ] && [ -z \"$(ls -A " + shellEscape(dir) + ")\" ]; then rmdir " + shellEscape(dir) + "; fi'"; sh(cmd); }
-        } else {
-            cerr<<C(ansi::yellow)<<"Aviso: manifest.dirs ausente; diretórios não foram removidos"<<C(ansi::reset)<<"\n";
-        }
-        // remover DB
-        sh("rm -rf "+shellEscape(d));
-        runHook("post-remove", dummy);
-        cout<<C(ansi::yellow)<<"Removido (arquivos/diretórios listados): "<<name<<"@"<<v<<C(ansi::reset)<<"\n";
+        if(install_with_binary_or_source(rr, rr.depends)!=0) return 1;
     }
-    return 0;
+    // Agora o alvo
+    string installedVer;
+    if(isInstalled(recipeName(r), &installedVer)){
+        cout<<C(ansi::yellow)<<"Já instalado: "<<recipeName(r)<<" "<<installedVer<<C(ansi::reset)<<"\n";
+        return 0;
+    }
+    return install_with_binary_or_source(r, r.depends);
 }
 
-int action_orphans(const vector<string>&args, const map<string,string>& opts){
-    // órfãos: instalados que não são dependência de ninguém
-    // (simplificado: todos exceto os que aparecem como dep em alguém)
-    auto all=listInstalled();
-    set<string> depd;
-    for(auto& pr: all){
-        auto m=readInstalled(pr.first, pr.second); if(!m) continue;
-        for(auto& c: m->depends){
-            // marca nome que é requerido, mas precisamos saber qual versão concreta satisfaz
-            // como já está instalado, considerar qualquer versão instalada com esse nome
-            for(auto& pr2: all) if(pr2.first==c.name && versionSatisfies(pr2.second,c)) depd.insert(keyOf(pr2.first, pr2.second));
+int action_remove(const vector<string>&args){
+    if(args.empty()){ cerr<<"Uso: fbuild remove <nome>\n"; return 1; }
+    string name=args[0];
+
+    // Checar reverse-deps
+    auto rdeps = reverseDepsOf(name);
+    if(!rdeps.empty()){
+        cerr<<C(ansi::red)<<"Não é seguro remover "<<name<<": outros pacotes dependem dele: ";
+        size_t i=0; for(auto &x: rdeps){ cerr<<x<<((++i<rdeps.size())?", ":""); }
+        cerr<<C(ansi::reset)<<"\n";
+        return 1;
+    }
+
+    // Recupera versão do DB para hooks
+    Recipe dummy; dummy.kv["name"]=name; dummy.kv["version"]="unknown";
+    string d=joinPath(cfg.DB,name);
+    string meta=joinPath(d,"meta");
+    ifstream mi(meta); if(mi){ string line; while(getline(mi,line)){ if(line.rfind("version=",0)==0) dummy.kv["version"]=trim(line.substr(8)); if(line.rfind("depends=",0)==0){ string rest=trim(line.substr(8)); stringstream ss(rest); string t; while(ss>>t) dummy.depends.push_back(t); } } }
+
+    runHook("pre-remove", dummy);
+
+    string mfpath = joinPath(d,"manifest.files");
+    string mdpath = joinPath(d,"manifest.dirs");
+
+    // Remoção de arquivos listados
+    ifstream mf(mfpath);
+    if(mf){
+        vector<string> files; string path;
+        while(getline(mf,path)){ path=trim(path); if(!path.empty()) files.push_back(path); }
+        for(auto it=files.rbegin(); it!=files.rend(); ++it){
+            string cmd = "bash -lc 'if [ -e " + shellEscape(*it) + " ] || [ -L " + shellEscape(*it) + " ]; then rm -f " + shellEscape(*it) + "; fi'";
+            sh(cmd);
         }
+    } else {
+        cerr<<C(ansi::yellow)<<"Aviso: manifest.files ausente; não é possível remover arquivos com precisão"<<C(ansi::reset)<<"\n";
     }
-    vector<pair<string,string>> orf;
-    for(auto& pr: all){
-        string k=keyOf(pr.first, pr.second);
-        if(!depd.count(k)) orf.push_back(pr);
+
+    // Remoção de diretórios *apenas* os listados (profundo → raso)
+    ifstream md(mdpath);
+    if(md){
+        vector<string> dirs; string path; while(getline(md,path)){ path=trim(path); if(!path.empty()) dirs.push_back(path); }
+        for(auto &dir: dirs){ string cmd = "bash -lc 'if [ -d " + shellEscape(dir) + " ] && [ -z \"$(ls -A " + shellEscape(dir) + ")\" ]; then rmdir " + shellEscape(dir) + "; fi'"; sh(cmd); }
+    } else {
+        cerr<<C(ansi::yellow)<<"Aviso: manifest.dirs ausente; diretórios não foram removidos"<<C(ansi::reset)<<"\n";
     }
-    if(orf.empty()){ cout<<"Nenhum órfão.\n"; return 0; }
-    bool removeMode = opts.count("remove");
-    for(auto& pr: orf){
-        cout<<pr.first<<"@"<<pr.second<<(removeMode?"  (removendo)":"")<<"\n";
-        if(removeMode){
-            map<string,string> o; o["force"]="1"; // seguro: órfão não tem dependentes
-            vector<string> a={pr.first};
-            o["version"]=pr.second;
-            action_remove(a,o);
-        }
-    }
+
+    // Remover reverse-deps registros
+    for(auto &dname: dummy.depends) reverseDepsRemove(dname, name);
+
+    dbUnregister(name);
+    runHook("post-remove", dummy);
+    cout<<C(ansi::yellow)<<"Removido: "<<name<<C(ansi::reset)<<"\n";
     return 0;
 }
 
 int action_upgrade(const vector<string>&args){
-    // Sem args: todos instalados; com args: apenas os listados
-    auto idx=buildRecipeIndex();
-    vector<pair<string,string>> targets;
-    auto all=listInstalled();
-    if(args.empty()){
-        targets=all;
-    } else {
-        for(auto& nm: args){
-            // pegar todas as versões instaladas do nome
-            for(auto& pr: all) if(pr.first==nm) targets.push_back(pr);
-        }
+    if(args.empty()){ cerr<<"Uso: fbuild upgrade <arquivo.fbuild|nome>\n"; return 1; }
+    string arg=args[0];
+    Recipe r;
+    if(fs::exists(arg)) r=loadRecipe(arg);
+    else {
+        string rf = findRecipeByNamePreferExact(arg);
+        if(rf.empty()){ cerr<<C(ansi::red)<<"Receita não encontrada: "<<arg<<C(ansi::reset)<<"\n"; return 1; }
+        r=loadRecipe(rf);
     }
-    if(targets.empty()){ cout<<"Nada para atualizar.\n"; return 0; }
-    for(auto& pr: targets){
-        Constraint want; want.name=pr.first; // sem constraint -> melhor versão
-        auto ent=selectRecipe(idx, want);
-        if(!ent){ cout<<pr.first<<" não encontrado nos repositórios.\n"; continue; }
-        if(cmpVersion(ent->version, pr.second)<=0){
-            cout<<pr.first<<" "<<pr.second<<" já está atualizado.\n";
-            continue;
-        }
-        cout<<"Atualizando "<<pr.first<<" "<<pr.second<<" -> "<<ent->version<<"\n";
-        Recipe r=loadRecipeFile(ent->file);
-        // manter prefixo anterior
-        auto m=readInstalled(pr.first, pr.second);
-        string alt = (m && !m->prefix.empty() && m->prefix!="/")? m->prefix: "";
-        // instalar nova versão
-        map<string,string> opt; if(!alt.empty()) opt["alt-prefix"]=alt;
-        vector<string> as = {ent->file};
-        action_install(as, opt);
-        // remover versão antiga (se você quiser manter lado a lado, comente esta parte)
-        map<string,string> ro; ro["version"]=pr.second; ro["force"]="1";
-        vector<string> ra={pr.first};
-        action_remove(ra, ro);
+    string curVer;
+    if(!isInstalled(recipeName(r), &curVer)){
+        cout<<"Não instalado. Instalando.\n";
+        return install_with_binary_or_source(r, r.depends);
+    }
+    if(curVer==recipeVersion(r)){
+        cout<<C(ansi::yellow)<<"Já na versão mais recente: "<<recipeName(r)<<" "<<curVer<<C(ansi::reset)<<"\n";
+        return 0;
+    }
+    cout<<"Atualizando "<<recipeName(r)<<" de "<<curVer<<" para "<<recipeVersion(r)<<"\n";
+    // Estratégia simples: instalar nova (vai sobrescrever arquivos). Manifesto antigo permanece para remoção futura.
+    return install_with_binary_or_source(r, r.depends);
+}
+
+int action_list(const vector<string>&){
+    // Lista pacotes instalados
+    for(auto &entry : fs::directory_iterator(cfg.DB)){
+        if(!entry.is_directory()) continue;
+        string meta = joinPath(entry.path().string(), "meta");
+        ifstream in(meta); if(!in) continue;
+        string name=entry.path().filename().string(), ver="unknown";
+        string line; while(getline(in,line)){ if(line.rfind("version=",0)==0){ ver=trim(line.substr(8)); break; } }
+        cout<<name<<" "<<ver<<"\n";
     }
     return 0;
 }
 
-// ========================= Resolver + Instalar com deps =========================
-int action_install_with_deps(const string& recipeFile, const map<string,string>& opts){
-    Recipe root = loadRecipeFile(recipeFile);
-    auto idx=buildRecipeIndex();
-    // já instalados
-    set<string> installed = installedKeys();
-    Constraint want; want.name=recipeName(root); want.op="="; want.ver=recipeVersion(root);
-    auto g = resolveDeps(idx, want, installed);
-    auto order = topoOrder(g); // do mais básico ao topo
-
-    // instalar na ordem (pula os já satisfeitos)
-    string alt = opts.count("alt-prefix")? opts.at("alt-prefix"): "";
-    int jobs = opts.count("jobs")? stoi(opts.at("jobs")): (cfg.JOBS>0? cfg.JOBS: 0);
-
-    for(auto& k: order){
-        auto p=k.find('@'); string nm=k.substr(0,p), vr=k.substr(p+1);
-        // se já tem instalado que satisfaz (versão igual), pula
-        if(installed.count(k)){
-            cout<<nm<<"@"<<vr<<" já instalado; pulando.\n";
-            continue;
+int action_orphans(const vector<string>&){
+    // órfãos = instalados que não são dependência de ninguém
+    auto rd = loadReverseDeps();
+    for(auto &entry : fs::directory_iterator(cfg.DB)){
+        if(!entry.is_directory()) continue;
+        string name=entry.path().filename().string();
+        if(name=="_reverse_deps") continue;
+        if(rd.find(name)==rd.end() || rd[name].empty()){
+            cout<<name<<"\n";
         }
-        // localizar arquivo do recipe correspondente no índice
-        Constraint cw; cw.name=nm; cw.op="="; cw.ver=vr;
-        auto ent=selectRecipe(idx, cw);
-        if(!ent){
-            // pode ser o root vindo de um arquivo fora dos repos: usar o recipeFile
-            if(nm==recipeName(root) && vr==recipeVersion(root)) ent = RecipeIndexEntry{nm,vr,recipeFile};
-            else { cerr<<C(ansi::red)<<"Recipe não encontrado para "<<k<<C(ansi::reset)<<"\n"; return 7; }
-        }
-        Recipe r = loadRecipeFile(ent->file);
-        int rc = buildAndMaybeInstall(r, true, alt, jobs, false);
-        if(rc!=0) return rc;
-        installed.insert(k);
     }
     return 0;
 }
 
-// ========================= Ajuda & Init =========================
+int action_clean(const vector<string>&){
+    sh("rm -rf "+shellEscape(cfg.WORK));
+    ensureDir(cfg.WORK);
+    cout<<"WORK limpo.\n";
+    return 0;
+}
+
 void help(){
-    cout<<"fbuild - gerenciador source-based (estendido)\n\n";
-    cout<<"Config: "<<cfg.CONF<<"\n";
-    cout<<"Variáveis (export): FB_CACHE, FB_WORK, FB_PKG, FB_DB, FB_LOG, DESTDIR, NO_COLOR\n\n";
-    cout<<"Comandos:\n";
-    cout<<"  init-repo                         # cria estrutura base de repositórios em "<<cfg.REPOS_ROOT<<"\n";
-    cout<<"  sync                              # atualiza todos os repositórios configurados\n";
-    cout<<"  search [termo]                    # procura receitas nos repositórios\n";
+    cout<<"fbuild - gerenciador source+bin (DESTDIR, binários .fbuildpkg, sha256, hooks)\n\n";
+    cout<<"Variáveis (export): REPO, FB_CACHE, FB_WORK, FB_PKG, FB_DB, FB_LOG, DESTDIR, FBUILD_PKGROOT, FBUILD_BUILDROOT\n\n";
+    cout<<"Flags globais:\n";
+    cout<<"  -y, --yes                auto-yes em prompts\n";
+    cout<<"  --no-color               desabilita cores\n";
+    cout<<"  --quiet                  menos saída\n";
+    cout<<"  -j, --jobs N             paralelismo de build (default: núcleos)\n";
+    cout<<"  -C, --config <path>      (reservado)\n";
+    cout<<"  --root <dir>             raiz final (DESTDIR real) para instalar (default: /)\n";
+    cout<<"  --repo <dir>             path do repositório de receitas\n";
+    cout<<"  --cache <dir>            cache de fontes\n";
+    cout<<"  --work <dir>             diretório de trabalho (sources extraídos)\n";
+    cout<<"  --db <dir>               banco de instalados\n";
+    cout<<"  --log <dir>              logs\n";
+    cout<<"  --pkgroot <dir>          raiz de pacotes binários (.fbuildpkg)\n";
+    cout<<"  --buildroot <dir>        raiz DESTDIR dos builds\n";
+    cout<<"  --binfmt <zst|gz>        compressão dos pacotes binários (default: zst)\n";
+    cout<<"\nComandos:\n";
+    cout<<"  init-repo                         # cria estrutura $REPO/{base,x11,extras,desktop}\n";
+    cout<<"  new <categoria> <nome> <ver>      # cria pasta e receita .fbuild\n";
+    cout<<"  sync                              # git pull no REPO\n";
+    cout<<"  search [termo]                    # procura receitas\n";
     cout<<"  info <arquivo.fbuild>             # mostra metadados\n";
-    cout<<"  download|dl <arquivo.fbuild>      # baixa fontes (com SHA256 opcional)\n";
-    cout<<"  unpack <arquivo.fbuild>           # baixa + descompacta + aplica patches\n";
-    cout<<"  patch <arquivo.fbuild>            # aplica patches (se já extraído)\n";
-    cout<<"  build|bi <arquivo.fbuild> [--alt-prefix /opt/... ] [--jobs N]\n";
-    cout<<"  install|in <arquivo.fbuild> [--alt-prefix ...] [--jobs N] [--force]\n";
-    cout<<"  remove|rm <nome> [--version X.Y.Z] [--force]\n";
-    cout<<"  upgrade [<nome>...]               # atualiza pacotes instalados (ou todos)\n";
-    cout<<"  orphans [--remove]                # lista órfãos; --remove para remover\n";
+    cout<<"  build <arquivo.fbuild>            # compila (sem instalar)\n";
+    cout<<"  install <arquivo.fbuild|nome>     # instala (binário se existir; senão compila)\n";
+    cout<<"  remove <nome>                     # remove via manifest.files/.dirs; checa reverse-deps\n";
+    cout<<"  upgrade <arquivo.fbuild|nome>     # reinstala se versão nova\n";
+    cout<<"  list                               # lista pacotes instalados\n";
+    cout<<"  orphans                            # lista pacotes sem dependentes\n";
     cout<<"  clean                              # limpa WORK\n";
     cout<<"  help                               # esta ajuda\n\n";
-    cout<<"Atalhos: dl=download, bi=build, in=install, rm=remove\n";
 }
 
-int action_init_repo(const vector<string>&){ ensureBaseDirs(); cout<<"Estrutura local de repositórios em "<<cfg.REPOS_ROOT<<"\n"; return 0; }
-int action_clean(const vector<string>&){ sh("rm -rf "+shellEscape(cfg.WORK)); ensureDir(cfg.WORK); cout<<"WORK limpo.\n"; return 0; }
+// ========================= init-repo =========================
+int action_init_repo(const vector<string>&){ ensureBaseDirs(); cout<<"Estrutura criada em "<<cfg.REPO<<"\n"; return 0; }
 
-// ========================= Parser de flags simples =========================
-map<string,string> parseOpts(vector<string>& args){
-    map<string,string> o;
-    vector<string> keep;
-    for(size_t i=0;i<args.size();++i){
-        string a=args[i];
-        if(startsWith(a,"--")){
-            string k=a.substr(2);
-            if(k=="force"||k=="remove"){ o[k]="1"; continue; }
-            // flags com valor
-            if(i+1<args.size() && !startsWith(args[i+1],"--")){
-                o[k]=args[i+1]; ++i; continue;
-            } else { o[k]="1"; continue; }
-        }
-        keep.push_back(a);
+// ========================= CLI parsing =========================
+struct Argv {
+    string cmd;
+    vector<string> args;
+};
+
+Argv parseArgs(int argc, char **argv){
+    Argv a;
+    for(int i=1;i<argc;i++){
+        string s=argv[i];
+        if(s=="-y"||s=="--yes"){ assume_yes=true; continue; }
+        if(s=="--no-color"){ no_color=true; continue; }
+        if(s=="--quiet"){ verbose=false; continue; }
+        if(s=="-j"||s=="--jobs"){ if(i+1<argc){ global_jobs=stoi(argv[++i]); } continue; }
+        if(s=="-C"||s=="--config"){ if(i+1<argc){ /* reservado */ ++i; } continue; }
+        if(s=="--root"){ if(i+1<argc){ cfg.DESTROOT=argv[++i]; ensureDir(cfg.DESTROOT); } continue; }
+        if(s=="--repo"){ if(i+1<argc){ cfg.REPO=argv[++i]; ensureDir(cfg.REPO); } continue; }
+        if(s=="--cache"){ if(i+1<argc){ cfg.CACHE=argv[++i]; ensureDir(cfg.CACHE); } continue; }
+        if(s=="--work"){ if(i+1<argc){ cfg.WORK=argv[++i]; ensureDir(cfg.WORK); } continue; }
+        if(s=="--db"){ if(i+1<argc){ cfg.DB=argv[++i]; ensureDir(cfg.DB); } continue; }
+        if(s=="--log"){ if(i+1<argc){ cfg.LOG=argv[++i]; ensureDir(cfg.LOG); } continue; }
+        if(s=="--pkgroot"){ if(i+1<argc){ cfg.PKGROOT=argv[++i]; ensureDir(cfg.PKGROOT); ensureDir(joinPath(cfg.PKGROOT,"bin")); } continue; }
+        if(s=="--buildroot"){ if(i+1<argc){ cfg.BUILDROOT=argv[++i]; ensureDir(cfg.BUILDROOT); } continue; }
+        if(s=="--binfmt"){ if(i+1<argc){ string v=argv[++i]; if(v=="zst"||v=="gz") global_binfmt=v; } continue; }
+
+        // primeiro não-flag é comando
+        if(a.cmd.empty()){ a.cmd=s; }
+        else { a.args.push_back(s); }
     }
-    args.swap(keep);
-    return o;
+    if(getenv("NO_COLOR")) no_color=true;
+    ensureBaseDirs();
+    return a;
 }
 
 // ========================= main =========================
 int main(int argc, char **argv){
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
-    string cmd = argc>=2? string(argv[1]): string("help");
-    if(getenv("NO_COLOR")) no_color=true; 
-    loadConfig();
-    ensureBaseDirs();
 
-    vector<string> args; for(int i=2;i<argc;i++) args.push_back(argv[i]);
-    auto opts = parseOpts(args);
+    auto pa = parseArgs(argc, argv);
+    string cmd = pa.cmd.empty()? string("help"): pa.cmd;
+    auto args = pa.args;
 
     if(cmd=="help"||cmd=="-h"||cmd=="--help") { help(); return 0; }
     if(cmd=="init-repo") return action_init_repo(args);
     if(cmd=="sync") return action_sync(args);
+    if(cmd=="new") return action_new(args);
     if(cmd=="search") return action_search(args);
     if(cmd=="info") return action_info(args);
-    if(cmd=="download"||cmd=="dl") return action_download(args);
-    if(cmd=="unpack") return action_unpack(args);
-    if(cmd=="patch") return action_patch(args);
-    if(cmd=="build"||cmd=="bi") return action_build(args, opts);
-    if(cmd=="install"||cmd=="in") {
-        // se for arquivo local .fbuild, resolvemos deps e instalamos tudo na ordem
-        if(args.empty()){ cerr<<"Uso: fbuild install <arquivo.fbuild>\n"; return 1; }
-        string file=args[0];
-        if(isFbuild(fs::path(file))){
-            return action_install_with_deps(file, opts);
-        }
-        // fallback: instalar diretamente (não recomendado)
-        return action_install(args, opts);
-    }
-    if(cmd=="remove"||cmd=="rm") return action_remove(args, opts);
+    if(cmd=="build") return action_build(args);
+    if(cmd=="install"||cmd=="in") return action_install(args);
+    if(cmd=="remove"||cmd=="rm") return action_remove(args);
     if(cmd=="upgrade") return action_upgrade(args);
-    if(cmd=="orphans") return action_orphans(args, opts);
+    if(cmd=="list") return action_list(args);
+    if(cmd=="orphans") return action_orphans(args);
     if(cmd=="clean") return action_clean(args);
 
     cerr<<C(ansi::red)<<"Comando desconhecido: "<<cmd<<C(ansi::reset)<<"\n";
     help();
     return 1;
 }
+
+/* ========================= Exemplo de receita =========================
+Salve como:
+$REPO/base/gcc-12.0/gcc-12.0.fbuild
+
+Conteúdo:
+
+name=gcc
+version=12.0.0
+summary=GNU Compiler Collection
+license=GPL-3.0
+homepage=https://gcc.gnu.org/
+source0=https://ftp.gnu.org/gnu/gcc/gcc-12.0.0/gcc-12.0.0.tar.xz
+sha2560=<INSIRA_SHA256_CORRETO>
+build_system=autotools
+build_opts=--disable-multilib --enable-languages=c,c++ --with-system-zlib
+# build_dir=gcc-12.0.0
+depends=binutils zlib gmp mpfr mpc
+
+========================= Notas =========================
+- DESTDIR é utilizado para isolar a instalação prévia ao empacotamento binário.
+- Pacotes binários são salvos em $FBUILD_PKGROOT/bin/<nome>-<versão>-<arch>.fbuildpkg + .sha256
+- Na instalação a partir de binário, a verificação SHA256 é aplicada se o arquivo .sha256 existir.
+- Hooks podem ser colocados em:
+  * Globais: $REPO/hooks/<hook>.sh
+  * Locais da receita: <dir_da_receita>/hooks/<hook>.sh
+  Hooks suportados: pre-download, post-download, pre-patch, post-patch, pre-build, post-build, pre-install, post-install, pre-remove, post-remove
+- Reverse-deps são mantidos em $DB/_reverse_deps (formato simples).
+- Para segurança/robustez extra em produção:
+  * substituir system() por execve/spawn
+  * adicionar verificação GPG para tarballs
+  * armazenar manifestos também dentro do .fbuildpkg para instalação binária com manifesto
+*/
